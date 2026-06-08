@@ -231,7 +231,19 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 | 离线消息、消息历史、回放、断线补发 | 适合(历史存数据库 + ajax 拉取, ws 只负责戳一下, 见 [`example/ReliableChat/`](example/ReliableChat/)) |
 | 大规模多节点分布式通知 | 需要额外改造(本库是单进程房间表) |
 
-`CVersionId` 与 `LiveData` 的选型(状态量 vs 一次性增量)见 [`example/ReliableChat/`](example/ReliableChat/) 的说明。
+## CVersionId 还是 LiveData?
+
+`FireChange` 可选携带 `CVersionId` 和 `LiveData`, 两者语义不同, 对接时容易选错:
+
+| | 服务端存储 | 进房/重连 | 适合什么 |
+| --- | --- | --- | --- |
+| `CVersionId`(≤100 字节) | 存内存当前值 | 进房/重连自动下发当前值 | **当前状态量**("是什么"): 在线/typing、未读数、数据版本号 |
+| `LiveData`(≤1024 字节) | 不存, 仅实时传一次 | 重连/缓冲满/超限就没了 | **一次性增量**("发生了什么"): 新消息、streaming 文本片段 |
+
+- **状态量用 `CVersionId`**。它是"当前完整状态", 丢一次通知没关系——下一次通知或进房/重连会带上最新值, **自动收敛到正确状态**。
+  例如 typing / 在线状态: `FireChange(RoomId, CVersionId="在线状态编码")`, 客户端 `onChange` 直接读 `ev.CVersionId` 更新 UI, **不需要 ajax**;
+  只在服务器重启(`CVersionId` 丢失、`RoomEpoch` 变化)时用 ajax 取一次当前完整状态保底。100 字节放状态编码或版本号通常够用, 不够就用 `CVersionId` 当版本号 + ajax 取完整列表。
+- **一次性增量用 `LiveData`**。丢了(缓冲满/断线/超 1024)就走 ajax 补。聊天消息属于这类(每条是新增内容, 不是"当前状态"), 见 [`example/ReliableChat/`](example/ReliableChat/)。
 
 ## 例子: 可靠聊天消息 + 离线消息/历史/断线补发
 
