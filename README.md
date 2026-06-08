@@ -217,9 +217,11 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 - 不要试图通过 ws 推送完整的大块数据(如完整 streaming 内容), 否则会有阻塞/爆内存风险。
   让 ws 只负责通知, 大数据走 ajax, 两条路径各司其职。
 
+为什么是"戳一下 + 拉取"而不是"直接用 ws 推内容当可靠", 以及为什么在本库约束下这已是已知最优结构(剩下只能调参数), 见 [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md)。
+
 ## 适用场景
 
-本库的设计前提是 **ws 通知 + ajax(或 http rpc)取数** 两条路径配合: ws 只负责"戳一下"告诉客户端某个 room 变了, 真实数据和可靠性由业务自己的数据库 + ajax 负责。在这个前提下:
+本库的设计前提是 **ws 通知 + ajax(或 http rpc)取数** 两条路径配合: ws 只负责"戳一下"告诉客户端某个 room 变了, 真实数据和可靠性由业务自己的数据库 + ajax 负责(原因见 [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md))。在这个前提下:
 
 | 场景 | 是否适合 |
 | --- | --- |
