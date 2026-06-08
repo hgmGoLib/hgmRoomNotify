@@ -215,6 +215,26 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 - 不要试图通过 ws 推送完整的大块数据(如完整 streaming 内容), 否则会有阻塞/爆内存风险。
   让 ws 只负责通知, 大数据走 ajax, 两条路径各司其职。
 
+## 例子: 可靠聊天消息 + 离线消息/历史/断线补发
+
+很多人会问: 本框架能不能做"聊天消息可靠送达"和"离线消息/消息历史/回放/断线补发"?
+答案是可以——把 ws 当"戳一下"的低延迟通道, 把 ajax(或 http rpc)当真实数据来源, 两者配合即可。
+对接代码很简单, 代价仅仅是某些情况(LiveData 不够用时)多一个 RTT。
+
+核心思路(完整可运行代码 + 自动测试见 [`example/ReliableChat/`](example/ReliableChat/)):
+
+1. 真正的可靠性锚点是**业务消息序号**(每个房间内单调递增, 存数据库), 不是 ws 层的 `ChangeSeq`
+   (`ChangeSeq` 只是"戳一下"信号, 服务器重启会重置)。
+2. 服务端每来一条消息: 先写库分配序号, 再 `FireChange`, 把整条消息塞进 `LiveData`(尽力而为)。
+3. 客户端收到 onChange:
+   - `LiveData` 有内容, 且序号正好接在本地最后一条之后 → 直接用 `LiveData` 应用, **0 额外 RTT**(快路径, 即"直接推送每一条聊天消息")。
+   - 否则(`LiveData` 没有/被丢弃/超 1024 字节/重连/服务器重启, 或者序号跳号说明中间漏了)→ **ajax 拉取本地最后序号之后的全部消息**补齐。
+4. "是不是断过线"不需要单独判断: 任何中断都会表现为"`LiveData` 缺失"或"序号跳号", 被上面的 ajax 路径统一兜住。
+   这条 ajax 路径同时就是"离线消息/历史/回放/断线补发"的实现——新客户端进房、断线重连、服务器重启后, 都靠它把缺的消息补回来。
+
+运行例子: `go run ./example/ReliableChat`; 跑自动测试: `go test ./example/ReliableChat/`。
+自动测试覆盖: 逐条快路径送达、突发连发不丢消息、超大 `LiveData` 降级 ajax、进房回放历史、ws 重启后断线补发。
+
 ## License
 
 [Unlicense](https://unlicense.org/)(public domain),外加 SQLite 那段祝福。见 [LICENSE](LICENSE)
