@@ -11,6 +11,8 @@
    - `GProcessId`+`ChangeSeq`: 框架自动维护。`GProcessId` 是服务端进程 id, `ChangeSeq` 每次 `FireChange` 递增, 客户端用来判断是否有新变化和检测服务器重启。
    - `CVersionId`: 调用者自定义的版本 id, 最大 100 字节。服务端内存存储。可选。服务器重启会丢失。
    - `LiveData`: 本次变更的附加数据, 最大 1024 字节。服务端不存储, 仅实时传递。可选。网络断线重连或者服务器重启会丢失。
+   - 选哪个: **当前状态量**("是什么", 如在线/typing、未读数、数据版本号)用 `CVersionId`(存当前值, 进房/重连自动下发, 丢一次会自动收敛, 必要时 ajax 保底);
+     **一次性增量**("发生了什么", 如新消息、streaming 片段)用 `LiveData`(尽力而为, 丢了走 ajax 补)。详见 [`example/ReliableChat/`](example/ReliableChat/)。
 5. 客户端断线后自动重连, 重连后自动重新加入所有之前的房间, 并收到当前版本号。
 6. 支持认证(可选): 服务端配置 `OnAllowFn` 回调, 同时处理连接级和房间级准入(`ctx.RoomId==""` 为连接级)。
    不配置则全部放行(和没有认证一样)。客户端发送 in-band identity(类似 sessionId/token, 本模块不解析),
