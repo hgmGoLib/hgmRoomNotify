@@ -217,6 +217,22 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 - 不要试图通过 ws 推送完整的大块数据(如完整 streaming 内容), 否则会有阻塞/爆内存风险。
   让 ws 只负责通知, 大数据走 ajax, 两条路径各司其职。
 
+## 适用场景
+
+本库的设计前提是 **ws 通知 + ajax(或 http rpc)取数** 两条路径配合: ws 只负责"戳一下"告诉客户端某个 room 变了, 真实数据和可靠性由业务自己的数据库 + ajax 负责。在这个前提下:
+
+| 场景 | 是否适合 |
+| --- | --- |
+| 新消息提醒(告诉客户端"这个会话变了") | 适合 |
+| 客户端收到通知后拉取最新消息列表 | 适合 |
+| 未读数、会话列表刷新通知 | 适合 |
+| typing / 在线状态这类当前状态量 | 适合(用 `CVersionId` 存当前状态, 进房/重连自动下发, 必要时 ajax 保底) |
+| 每条聊天消息可靠送达 | 适合(ws 通知 + ajax 兜底, 见 [`example/ReliableChat/`](example/ReliableChat/); 纯靠 ws `LiveData` 当可靠送达不适合) |
+| 离线消息、消息历史、回放、断线补发 | 适合(历史存数据库 + ajax 拉取, ws 只负责戳一下, 见 [`example/ReliableChat/`](example/ReliableChat/)) |
+| 大规模多节点分布式通知 | 需要额外改造(本库是单进程房间表) |
+
+`CVersionId` 与 `LiveData` 的选型(状态量 vs 一次性增量)见 [`example/ReliableChat/`](example/ReliableChat/) 的说明。
+
 ## 例子: 可靠聊天消息 + 离线消息/历史/断线补发
 
 很多人会问: 本框架能不能做"聊天消息可靠送达"和"离线消息/消息历史/回放/断线补发"?
