@@ -267,4 +267,4 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 
 ## License
 
-[Unlicense](https://unlicense.org/)(public domain),外加 SQLite 那段祝福。见 [LICENSE](LICENSE)
+[Unlicense](https://unlicense.org/)(public domain)
