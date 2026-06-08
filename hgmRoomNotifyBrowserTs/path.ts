@@ -2,9 +2,9 @@
 // 类似 filepath.Dir 砍掉最后一截,获取前面一部分.
 // 有问题返回 "/"
 // 最后没有 /
-import {hgmStringTrimPrefix} from "./hgmTsWeb_strings.ts";
+import {stringTrimPrefix} from "./strings.ts";
 
-export function hgmPath_RemoveLastSection(absPath:string):string{
+export function pathRemoveLastSection(absPath:string):string{
     if (absPath==="/"){
         return "/"
     }
@@ -16,14 +16,14 @@ export function hgmPath_RemoveLastSection(absPath:string):string{
 }
 
 // 路径合并,结果只能是个绝对路径
-export function hgmPath_Join(...pathList:string[]):string{
+export function pathJoin(...pathList:string[]):string{
     if (pathList.length===0){
         return "/"
     }
     let out = "/"
     let hasWrite = false
     for (let path of pathList){
-        path = hgmStringTrimPrefix(path,"/")
+        path = stringTrimPrefix(path,"/")
         if (path===""){
             continue
         }

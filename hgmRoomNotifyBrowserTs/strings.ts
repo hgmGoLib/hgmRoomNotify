@@ -1,4 +1,4 @@
-export function hgmStringTrimPrefix(s:string,prefix:string):string{
+export function stringTrimPrefix(s:string,prefix:string):string{
     if (s.startsWith(prefix)===false){
         return s
     }
