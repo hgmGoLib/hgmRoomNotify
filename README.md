@@ -229,7 +229,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 | typing / 在线状态这类当前状态量 | 适合(用 `CVersionId` 存当前状态, 进房/重连自动下发, 必要时 ajax 保底) |
 | 每条聊天消息可靠送达 | 适合(ws 通知 + ajax 兜底, 见 [`example/ReliableChat/`](example/ReliableChat/); 纯靠 ws `LiveData` 当可靠送达不适合) |
 | 离线消息、消息历史、回放、断线补发 | 适合(历史存数据库 + ajax 拉取, ws 只负责戳一下, 见 [`example/ReliableChat/`](example/ReliableChat/)) |
-| 大规模多节点分布式通知 | 需要额外改造(本库是单进程房间表) |
+| 大规模多节点分布式通知 | 需要额外改造(本库是单进程房间表)。看起来有办法解决、且全广播档不用改库,理论分析见 [`doc/multiNodeDistribute.md`](doc/multiNodeDistribute.md)(**仅理论,未实践**) |
 
 ## CVersionId 还是 LiveData?
 
