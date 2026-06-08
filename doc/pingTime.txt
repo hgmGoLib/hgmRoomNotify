@@ -1,0 +1,192 @@
+hgmRoomNotify 客户端 keepalive 与读超时
+============================================
+
+目标
+----
+在一个 ws 长连接上, 用最少的额外流量, 在以下两件事之间取得平衡:
+1. 网络坏掉时(中间转发链路 block / 对端进程不响应) 客户端要尽快感知到, 主动断开重连.
+2. 网络好但是 业务 暂时没流量, 不要误判, 不要无意义地频繁断开.
+
+抽象算法 (与实现解耦)
+=======================
+
+参与的"事件":
+* 写成功 W: 客户端成功写出一个 ws message (任何上行).
+* 读成功 R: 客户端成功读到一个 ws message (任何下行, 包括 server 回的 ping).
+* 发起 ping 尝试 P: 客户端"开始"发一个 keepalive ping (无论是否真的写到对端).
+
+参与的"时间戳" (按事件刷新):
+* tW = 最近一次 W 的时间.
+* tR = 最近一次 R 的时间.
+* tP = 最近一次 P 的时间.
+
+参与的"参数":
+* dur          = idle->ping 的时间.       (默认 4.5s)
+* readTimeout  = 没读到任何下行多久则断开. (默认 10s)
+
+约束:
+* 强制要求 dur < readTimeout (否则 ping 节奏跟不上读超时).
+
+A. 何时发 ping (idle 检测)
+   下一次允许发 ping 的时间点:
+       fireAt = max( tP + dur ,  min(tW + dur, tR + dur) )
+                       └ 速率限制         └ idle 触发
+   也就是:
+       a) tP + dur 之前 不允许再发 ping (速率限制, 每 dur 最多 1 次).
+       b) min(tW, tR) + dur 之后 应当尝试发 ping (上行 idle 或 下行 idle, 任意一边超过 dur 就触发).
+       c) 实际触发时间 = 两者较晚的那个.
+
+   直观解释:
+   * 上下行都活跃: tW, tR 都很新, min 在未来, fireAt 也在未来, 自然没有 ping (业务自身就在保活).
+   * 上行/下行 任意一边静默超过 dur: min 落到当前/过去, fireAt ≈ tP + dur, ping 按 dur 节奏出.
+   * 完全静默: 三个时间戳都靠近"建立连接的时刻", fireAt = 该时刻 + dur, 之后每 dur 一次.
+
+   注意 a) 和 b) 是并列且 b) 优先级低: 不论 idle 多久, 只要还在速率窗内就不发. 这样能挡住意外的并发触发(read+write
+   先后两次刷新 都各想触发一次 ping)以及 ping 自己被回声后立即又被触发的退化.
+
+B. 何时主动断开 (读超时)
+   维护一个 deadline = tR + readTimeout. 一旦 wall-clock now >= deadline 就主动关闭连接, 走重连.
+   等价表述: 每次 R 事件刷新 tR, 把 deadline 推后 readTimeout.
+
+C. 服务端对偶
+   服务端有完全对偶的 deadline = (server 端的 tR) + serverReadTimeout (默认 120s).
+   服务端不主动发 ping. 客户端的 ping 同时充当"叫醒服务端" 与 "测试链路", server 收到 Cmd_ping 后
+   原样回写一份给 client (echo). 这条 echo 既刷新 client 的 tR (B), 也刷新 server 的 tR (服务端 B).
+
+正确性骨架 (一句话)
+   只要 dur << readTimeout, A) 保证连接两侧都至少每 dur 在双向看到一个 ping/echo 包, 因此 B) 的
+   deadline 一直被推后, 不会误触发. 反过来, 一旦真的双向 block, ping 没有 echo, B) 在 readTimeout
+   内必然到期, 触发断开重连.
+
+
+配置项 (TimeoutCfg_t)
+=====================
+
+* ClientIdleToSendKeepAliveDur (= 上面的 dur, 默认 4.5s, 最小 100ms)
+* ClientLastReadToReconnectDur (= 上面的 readTimeout, 默认 10s, 最小 100ms)
+* ServerLastReadToCloseDur     (= 服务端的 readTimeout, 默认 120s, 仅服务端使用, 不参与协议序列化)
+默认值的最小钳制由 03libProtocol.go func InitWithDefault 用 hgmMath.InitDefaultMin 完成.
+
+
+具体如何实现
+=============
+
+涉及代码位置:
+* client.go func (c *client_conn) resetClientIdleToSendKeepAlive    (A 的调度)
+* client.go func (c *Client) tryConnOnceSync                        (连接初始化, 定时器接线, 发 ping)
+* client.go thisConn.timerClientIdleToSendKeepAlive                 (A 的定时器)
+* client.go thisConn.timerClientLastReadToReconnect                 (B 的定时器)
+* 02server.go sconn.timerServerLastReadToClose                      (C 服务端读超时定时器)
+* 02server.go onReadMsg case Cmd_ping: sconn.sendMsgNoBlock(msg)    (C 服务端 ping echo)
+* 03libProtocol.go TimeoutCfg_t / Cmd_ping / func InitWithDefault   (配置项与默认值)
+
+连接级状态字段 (client_conn):
+* lastWriteSuccTime     = tW
+* lastReadSuccTime      = tR
+* lastKeepAliveSendTime = tP
+
+A 的实现 (resetClientIdleToSendKeepAlive):
+    dur := ClientIdleToSendKeepAliveDur
+    t1  := lastKeepAliveSendTime + dur
+    t2  := lastWriteSuccTime     + dur
+    t3  := lastReadSuccTime      + dur
+    minOfT2AndT3 := min(t2, t3)
+    fireAt := max(t1, minOfT2AndT3)
+    timerClientIdleToSendKeepAlive.After(fireAt - now)
+    (TimerNoLock.After 给 <=0 的 dur 立刻触发, 与 Go 标准库一致)
+
+调度被刷新的时机 (在 tryConnOnceSync 里接线):
+* 连接刚建立: tW, tR, tP 全部赋值为 now, 调一次 reset (第一次 ping 在 now+dur).
+* onReadFinishSucc:  tR = now; 重置 timerClientLastReadToReconnect; 重调度 keepalive.
+* onWriteFinishSucc: tW = now; 重调度 keepalive.
+* timerClientIdleToSendKeepAlive 触发时(SetFn里):
+      tP = now;
+      重调度 keepalive (即使下面这步 writeMsg 失败也保留节奏);
+      writeMsg(Cmd_ping)   (写成功会再走 onWriteFinishSucc -> 又一次重调度).
+
+B 的实现 (timerClientLastReadToReconnect):
+* 连接建立时: After(ClientLastReadToReconnectDur).
+* 每次 onReadFinishSucc: 先更 tR, 再 After(ClientLastReadToReconnectDur) (整个 deadline 推后).
+* 触发时: logClose(CloseReason_closeByReadTimeout, "") + closer.Close2() -> 上层 _init_afterEnter 循环走重连.
+
+C 的实现 (服务端):
+* 服务端在 ServeHTTP 里给每个连接装一个 timerServerLastReadToClose, 触发就 Close2.
+* 每次 onReadFinishSucc: 调 resetServerLastReadToClose -> After(ServerLastReadToCloseDur).
+* onReadMsg 收到 Cmd_ping 时, 直接把整条消息 sendMsgNoBlock 回去 (echo, 不走业务逻辑).
+
+关闭路径:
+* thisConn.conn.closer.AddOnClose 里把 timerClientIdleToSendKeepAlive / timerClientLastReadToReconnect 都 Stop().
+* 服务端对偶: sconn.conn.closer.AddOnClose 里 Stop 服务端的相关 timer.
+
+实现细节微注释:
+* lastKeepAliveSendTime 在 SetFn 里 是 "在写之前" 就更新的, 不是写成功后才更新. 这样即使 writeMsg
+  在某种异常下耗时较长, 也不会被解释成 "上次发完隔得很短, 应继续发", 防止退化成 ping 风暴.
+* onWriteFinishSucc 会触发一次 keepalive 重调度, ping 自身写成功也走这条路径.
+  此时 tW = now, 但 tP 也刚被设到 now, fireAt = max(tP+dur, min(tW+dur, tR+dur)) = tP+dur,
+  下次 ping 仍按 dur 节奏发出 (没有死循环).
+
+
+正反向场景与测试
+=================
+
+下面列出的所有测试都在 hgmRoomNotify 包内. 没有特别说明的都不需要 IS_RUN_SLOW.
+
+* 场景1: 中间转发路由器忽然双向 block 长时间, 然后会断开. (用 hgmTcpMockProxy.SetBlock 模拟)
+    测试: TestPingTime_blockDisconnect       (快速测试, 默认运行)
+    测试: TestPingFail_serverBlock            (慢速测试, 需 IS_RUN_SLOW=1, 见 TestPingFail_serverBlock_test.go)
+    测试: TestPingFail_serverBlock2           (慢速测试, 需 IS_RUN_SLOW=1, 重复跑3遍稳定性验证)
+    验证: 网络阻塞超过 ClientLastReadToReconnectDur 客户端主动关闭连接(CloseReason_closeByReadTimeout).
+          网络恢复后 客户端走 reconnect 重新建连成功.
+
+* 场景2: 长时间 只有上传 app 流量(client 持续 RoomEnter, server 不 FireChange), 不会断开.
+    测试: TestPingTime_uploadOnlyTraffic
+    验证: 等待 2 倍 ClientLastReadToReconnectDur, 不发生重连(GetWsDialNum 不变), IsConnectedSucc 仍为 true.
+          说明 keepalive 在持续上传场景下仍能定期发出 ping 并接收到 server 的 ping 回应,
+          从而让 timerClientLastReadToReconnect 持续被重置.
+
+* 场景3: 长时间 只有下载 app 流量(server 持续 FireChange, client 不操作房间), 不会断开.
+    测试: TestPingTime_downloadOnlyTraffic
+    验证: 等待 2 倍 ClientLastReadToReconnectDur, 不发生重连, IsConnectedSucc 仍为 true.
+          客户端通过下行流量自然刷新 lastReadSuccTime, 并且 keepalive 算法依据 min(lastWrite, lastRead) idle
+          检查不会因为长时间无写入就让连接误判异常.
+
+* 场景4: 长时间 没有任何 app 流量(连接 idle 但 ws 通的), 不会断开.
+    测试: TestPingTime_idleNoTraffic
+    验证: 等待 2 倍 ClientLastReadToReconnectDur, 不发生重连, IsConnectedSucc 仍为 true.
+          完全依赖 keepalive ping 维持连接(server 收到 ping 原样回写).
+
+* 场景5(扩展): 网络先 block 触发断开, 再恢复后稳定一段时间不会多余重连.
+    测试: TestPingTime_blockThenRecoverStable
+    验证: block 让连接断开 -> SetNormal 让客户端重连成功 ->
+          稳定一段时间后 IsConnectedSucc 仍 true 且 GetWsDialNum 不再增长.
+
+(其他既有相关测试, 不在本文档主要场景内但也覆盖了 keepalive/重连路径)
+* TestPingFail_serverDisconnect      慢速测试, 中间路由器 RST, 客户端立即重连.
+* TestPingFail_clientStartFirst      服务端晚于客户端启动, 客户端重连成功后正常工作.
+* TestNormal                         正常 RoomEnter/FireChange 流程, 也覆盖 keepalive 周期内的稳定性.
+* TestRepeatEntry                    同一 roomId 反复进出.
+
+
+注意事项
+=========
+
+* 注意事项1 (idle 与 readTimeout 的硬约束):
+    InitWithDefault 末尾会强制
+        if ClientIdleToSendKeepAliveDur*2 > ClientLastReadToReconnectDur:
+            ClientIdleToSendKeepAliveDur = ClientLastReadToReconnectDur / 2
+    原因: 算法的正确性骨架(参见上面"抽象算法-正确性骨架")要求 dur << readTimeout, 否则一次 ping
+    的 echo 来回时间就可能撞上读超时, 健康连接被误判断开. 用 idle*2 <= readTimeout 作为强制下界,
+    是一个比较保守但好理解的关系(echo 来不及回的最坏情况下还有半个窗口余量).
+    上层调用者可以乱配, InitWithDefault 会兜底. 但建议直接配合理的值, 避免被静默调整.
+    覆盖测试: TestPingTime_misconfigIdleVsReadTimeoutClamp.
+
+* 注意事项2 (cold start 第一条消息延迟):
+    连接刚建立时 tW = tR = tP = t0, timerClientLastReadToReconnect 在 t0 + readTimeout 触发.
+    如果服务端这段时间内没发任何消息(比如服务端在 ws upgrade 后做大量同步初始化, 或 ServeHTTP
+    被某个慢中间件卡住), client 会在 t0 + readTimeout 主动关闭连接, 然后走 reconnect 循环, 反复
+    上演 connect -> readTimeout -> reconnect 的死循环.
+    本算法对此的"反应"是合理的(没有 R 事件就该判为坏连接), 但运维上要保证服务端 ws upgrade 之后
+    在 ClientLastReadToReconnectDur 内能发出至少一条消息(setTimeCfg 是天然的第一条, 见
+    02server.go ServeHTTP 末尾的 sendMsgNoBlock(Cmd_setTimeCfg)). 不要在 OnAcceptFn 等
+    路径上引入慢逻辑.
+    覆盖测试: TestPingTime_coldStartFirstMsgDelay.

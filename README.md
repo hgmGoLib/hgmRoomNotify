@@ -1,0 +1,220 @@
+# hgmRoomNotify
+
+基于 WebSocket 的房间状态变更通知框架。
+
+## 能干什么
+
+1. 服务端维护若干"房间"(Room), 每个房间有一个字符串 id。
+2. 客户端通过 WebSocket 连接后, 可以加入/离开房间。
+3. 服务端调用 `FireChange(roomId)` 时, 所有订阅了该房间的客户端会收到变更通知。
+4. 变更通知携带三个信息:
+   - `GProcessId`+`ChangeSeq`: 框架自动维护。`GProcessId` 是服务端进程 id, `ChangeSeq` 每次 `FireChange` 递增, 客户端用来判断是否有新变化和检测服务器重启。
+   - `CVersionId`: 调用者自定义的版本 id, 最大 100 字节。服务端内存存储。可选。服务器重启会丢失。
+   - `LiveData`: 本次变更的附加数据, 最大 1024 字节。服务端不存储, 仅实时传递。可选。网络断线重连或者服务器重启会丢失。
+5. 客户端断线后自动重连, 重连后自动重新加入所有之前的房间, 并收到当前版本号。
+6. 支持认证(可选): 服务端配置 `OnAllowFn` 回调, 同时处理连接级和房间级准入(`ctx.RoomId==""` 为连接级)。
+   不配置则全部放行(和没有认证一样)。客户端发送 in-band identity(类似 sessionId/token, 本模块不解析),
+   也可由网络层(ws cookie/url query)经 `OnAcceptFn` 提供网络层 sessionId。两个身份来源互相独立。
+7. 支持运行时撤权/踢下线: 服务端 `conn.CloseConn(isTemp,reason)` 或 `CloseConnBySessionId(sessionId,isTemp,reason)`。
+   `isTemp=true` 客户端重连(重连重新过 `OnAllowFn`, 用于撤权); `isTemp=false` 客户端不再重连(永久封禁/下线)。
+8. 客户端配置 `OnDenyFn` 处理被拒(连接级/房间级)。不配置时遇到 deny 视为对接错误(断开且不再重连, 应修复 bug)。
+9. 有 Go 客户端和浏览器 TypeScript 客户端两套实现。
+
+## 怎么干 (服务端 Go)
+
+1. 创建 `ServerManager` 实例, 配置超时参数和认证回调:
+
+   ```go
+   var wsServer hgmRoomNotify.ServerManager
+   wsServer.OnAcceptFn = func(ctx *hgmRoomNotify.ServerOnAccept_ctx_t) {
+       // 从 ctx.R 读 cookie 做认证
+       ctx.SessionId = "userId"
+   }
+   ```
+
+2. 将 `ServerManager` 注册为 `http.Handler` (它实现了 `ServeHTTP`):
+
+   ```go
+   mux := http.NewServeMux()
+   mux.Handle("/ws", &wsServer)
+   httpServer := httptest.NewServer(mux) // 生产环境用 http.ListenAndServe(addr, mux)
+   defer httpServer.Close()
+   ```
+
+   或者在已有框架中对接, 拿到 `http.ResponseWriter` 和 `*http.Request` 后调用 `wsServer.ServeHTTP(w, r)`。
+
+3. 业务代码中, 数据变更时调用 `FireChange`:
+
+   ```go
+   wsServer.FireChange(hgmRoomNotify.RoomEvent_t{
+       RoomId:     "order:12345",
+       CVersionId: "v3",                          // 可选
+       LiveData:   []byte(`{"Status":"paid"}`),   // 可选, 最大 1024 字节
+   })
+   ```
+
+   所有订阅了 `"order:12345"` 这个房间的客户端都会收到通知。
+
+## 怎么干 (浏览器 TypeScript 客户端)
+
+1. 创建客户端实例并设置 URL:
+
+   ```ts
+   import { WssChangeStatus3_t } from "./hgmWs3_ChangeStatus"
+   const ws = new WssChangeStatus3_t()
+   ws.setUrl("/ws")  // 会自动根据当前页面协议转为 wss:// 或 ws://
+   ```
+
+2. 加入房间并监听变更:
+
+   ```ts
+   const leaveFn = ws.roomEnter("order:12345", (ev) => {
+       // ev.RoomId      房间 id
+       // ev.GProcessId  服务端进程 id(用于检测服务器重启, 通常不需要关心)
+       // ev.ChangeSeq   变化序号(用于去重, 通常不需要关心)
+       // ev.CVersionId  自定义版本号
+       // ev.LiveData    Uint8Array|null, 附加数据
+       console.log("房间变更", ev.CVersionId)
+       // 这里发 ajax 请求获取最新数据...
+   })
+   ```
+
+3. 不再需要时离开房间:
+
+   ```ts
+   leaveFn()  // 取消订阅。所有房间都离开后连接会在 20 秒后自动关闭。
+   ```
+
+## 怎么干 (Go 客户端)
+
+1. 创建客户端实例:
+
+   ```go
+   var client hgmRoomNotify.Client
+   client.SetWsDialUrl("wss://example.com/ws")
+   ```
+
+2. 加入房间:
+
+   ```go
+   leaveFn := client.RoomEnter("order:12345", func(ev *hgmRoomNotify.RoomOnChange_t) {
+       // ev.RoomId, ev.GProcessId, ev.ChangeSeq, ev.CVersionId, ev.LiveData
+   })
+   ```
+
+3. 离开房间:
+
+   ```go
+   leaveFn()
+   ```
+
+完整可运行的 Go 端 demo(服务端 + 客户端在一个进程里跑起来)见 [`example/`](example/), 运行 `go run ./example`。
+
+## 调试/状态查询
+
+客户端提供以下方法用于查询当前运行状态, 方便调试和 UI 展示。
+
+Go 客户端:
+
+```go
+client.GetUiStatusToUser()          // 返回 "synced"/"syncing"/"offline"/"needManual"
+client.GetSinceLastServerConfirm()  // 返回 time.Duration, 距离上次收到服务端有效消息的时间。从未收到过返回 -1。
+client.GetNeedManualMsg()           // 返回 needManual 状态的原因文本。空字符串表示不在 needManual 状态。
+client.GetRoomCount()               // 返回当前订阅的房间数量。
+client.IsConnectedSucc()            // 返回 ws 是否已连接。
+client.GetClientStatus()            // 返回 ClientStatus_t 结构体(含 Type/HasNeed/LastCloseReason/LastCloseLog/IsStopListen)。
+```
+
+TypeScript 客户端:
+
+```ts
+ws.GetUiStatusToUser()              // 返回 "synced"/"syncing"/"offline"/"needManual"
+ws.GetSinceLastServerConfirm()      // 返回毫秒数。从未收到过返回 -1。
+ws.GetNeedManualMsg()               // 返回 needManual 状态的原因文本。空字符串表示不在 needManual 状态。
+ws.GetRoomCount()                   // 返回当前订阅的房间数量。
+ws.IsConnectedSucc()                // 返回 ws 是否已连接。
+```
+
+使用示例(前端调试面板):
+
+```ts
+const status = ws.GetUiStatusToUser()
+const sinceLast = ws.GetSinceLastServerConfirm()
+const manualMsg = ws.GetNeedManualMsg()
+debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.GetRoomCount()} needManual=${manualMsg}`
+```
+
+## 协议要点
+
+- 二进制协议, 一个 WebSocket message 可以包含多个协议消息。
+- 每个协议消息格式: `[uint16LE 长度][消息体]`。
+- 消息类型: `ping(1)`, `setTimeCfg(2)`, `roomEnter(3)`, `roomLeave(4)`, `roomValue(5)`, `identity(6)`, `connAllow(7)`, `deny(8)`, `closeConn(9)`。
+  - `identity`: 客户端->服务端首包(opaque 凭证)。
+  - `connAllow`: 服务端->客户端连接已批准(携带 `AuthEnabled`)。
+  - `deny`: 服务端->客户端拒绝(连接/房间)。
+  - `closeConn`: 服务端->客户端要求关闭(临时/永久)。
+- 认证流程: 客户端连上先发 `identity`, 服务端配置了 `OnAllowFn` 则等批准(`connAllow`)再发 `roomEnter`; 未配置则服务端立即发 `connAllow`(`AuthEnabled=false`), 零额外往返。
+- `setTimeCfg` 使用 KV 格式: `[count: uint8][ [fieldId: uint8][value: int64LE] ] * count`。`fieldId` 见 `TimeoutCfg_t` 注释, 不认识的 `fieldId` 跳过(前向兼容)。
+- 心跳: 客户端空闲时主动发 ping, 服务端回复 ping。超时未收到数据则断线重连。
+- 服务端写缓冲满时主动断开该连接(客户端太慢, 丢弃)。
+
+## 保证与不保证
+
+保证:
+
+- 在网络正常时, 客户端最终一定能感知到房间"是否发生了变化"(通过 `GProcessId`+`ChangeSeq` 去重)。
+  即: 如果服务端 `FireChange` 了, 客户端一定会收到一次 onChange 回调(去重后)。
+  如果服务端没有 `FireChange`, 客户端不会收到虚假的 onChange 回调。
+- 断线重连后, 客户端重新加入房间会收到当前版本号, 如果和断线前不同则触发 onChange。
+  所以客户端不会错过"最终状态有变化"这件事。
+
+不保证:
+
+- 中间状态可能丢失。比如服务端连续 `FireChange` 了 3 次(v1->v2->v3), 客户端可能只收到 v3。
+  断线重连期间的所有中间变更都会丢失, 客户端只看到重连后的最新版本。
+  客户端处理太慢, 中间变更可能会丢失。
+- `LiveData` 不保证送达。服务端写缓冲满时丢弃, 断线时丢失, 超 1024 字节时丢弃。
+  `LiveData` 是尽力而为的附加数据, 不是可靠传输。
+
+不实现:
+
+- 不实现注册订阅模式(即不存储事件历史, 不支持从某个版本号开始回放)。
+  客户端的职责是: 收到变更通知后, 自己通过 ajax 去获取最新完整数据。
+  本框架只负责"戳一下"告诉客户端该去取了, 不负责传输完整业务数据。
+
+## 限制
+
+- `LiveData` 最大 1024 字节。超过 1024 字节的数据静默丢弃(不发送 `LiveData` 但通知仍然发出)。
+- `CVersionId` 最大 100 字节。超过会 panic。
+- `RoomId` 最大 1024 字节(服务端校验)。超过会断开连接。
+- 服务端单条协议消息最大 4096 字节(序列化后)。超过会断开连接。当前所有消息类型最大约 2420 字节, 在限制内。
+- 服务端不存储 `LiveData`, 客户端断线重连后不会补发之前的 `LiveData`。
+- 房间没有历史记录, 客户端只能收到订阅后的变更。
+
+## 典型使用模式: ws 通知 + ajax 获取
+
+本框架的设计意图是作为"变更通知层", 配合 ajax 获取实际数据:
+
+1. 服务端数据变更时 → `FireChange(roomId)`, 可选带少量 `LiveData`。
+2. 客户端收到 onChange → 发 ajax 请求获取最新完整数据。
+3. 断线重连 → 重新加入房间 → 发现版本号变了 → ajax 取最新数据。
+
+这种模式的好处:
+
+- 事件只存内存, 不需要数据库持久化事件, 没有事件存储/清理的复杂逻辑。
+- 实际业务数据的持久化由已有的数据库负责, ws 层不重复存储。
+- 性能容易优化: `FireChange` 只是内存操作+写 ws 缓冲, 不涉及 IO。
+- 慢客户端不影响其他客户端: 写缓冲满了就断开那一个连接, 不阻塞广播。
+- 不会爆内存: 每个连接独立的固定大小写缓冲(默认 64KB), `LiveData` 不存储。
+
+对于 streaming 场景(如 AI streaming 输出)的经验:
+
+- `LiveData` 1024 字节放一次 200ms 间隔内的增量文本, 大多数情况够用(200ms 内 AI 产生的文本通常几十到几百字节)。
+- 偶尔一次增量超了 1024 字节, `LiveData` 会被丢弃, 但通知仍然发出, 前端发现 `LiveData` 为 null 时走 ajax 补取。
+- 断线重连本身就要 ajax 重新取完整状态, 所以这个降级路径本来就得有。
+- 不要试图通过 ws 推送完整的大块数据(如完整 streaming 内容), 否则会有阻塞/爆内存风险。
+  让 ws 只负责通知, 大数据走 ajax, 两条路径各司其职。
+
+## License
+
+[Unlicense](https://unlicense.org/)(public domain),外加 SQLite 那段祝福。见 [LICENSE](LICENSE)
