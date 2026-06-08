@@ -11,6 +11,8 @@
    - `GProcessId`+`ChangeSeq`: 框架自动维护。`GProcessId` 是服务端进程 id, `ChangeSeq` 每次 `FireChange` 递增, 客户端用来判断是否有新变化和检测服务器重启。
    - `CVersionId`: 调用者自定义的版本 id, 最大 100 字节。服务端内存存储。可选。服务器重启会丢失。
    - `LiveData`: 本次变更的附加数据, 最大 1024 字节。服务端不存储, 仅实时传递。可选。网络断线重连或者服务器重启会丢失。
+   - 选哪个: **当前状态量**("是什么", 如在线/typing、未读数、数据版本号)用 `CVersionId`(存当前值, 进房/重连自动下发, 丢一次会自动收敛, 必要时 ajax 保底);
+     **一次性增量**("发生了什么", 如新消息、streaming 片段)用 `LiveData`(尽力而为, 丢了走 ajax 补)。详见 [`example/ReliableChat/`](example/ReliableChat/)。
 5. 客户端断线后自动重连, 重连后自动重新加入所有之前的房间, 并收到当前版本号。
 6. 支持认证(可选): 服务端配置 `OnAllowFn` 回调, 同时处理连接级和房间级准入(`ctx.RoomId==""` 为连接级)。
    不配置则全部放行(和没有认证一样)。客户端发送 in-band identity(类似 sessionId/token, 本模块不解析),
@@ -215,6 +217,54 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 - 不要试图通过 ws 推送完整的大块数据(如完整 streaming 内容), 否则会有阻塞/爆内存风险。
   让 ws 只负责通知, 大数据走 ajax, 两条路径各司其职。
 
+## 适用场景
+
+本库的设计前提是 **ws 通知 + ajax(或 http rpc)取数** 两条路径配合: ws 只负责"戳一下"告诉客户端某个 room 变了, 真实数据和可靠性由业务自己的数据库 + ajax 负责。在这个前提下:
+
+| 场景 | 是否适合 |
+| --- | --- |
+| 新消息提醒(告诉客户端"这个会话变了") | 适合 |
+| 客户端收到通知后拉取最新消息列表 | 适合 |
+| 未读数、会话列表刷新通知 | 适合 |
+| typing / 在线状态这类当前状态量 | 适合(用 `CVersionId` 存当前状态, 进房/重连自动下发, 必要时 ajax 保底) |
+| 每条聊天消息可靠送达 | 适合(ws 通知 + ajax 兜底, 见 [`example/ReliableChat/`](example/ReliableChat/); 纯靠 ws `LiveData` 当可靠送达不适合) |
+| 离线消息、消息历史、回放、断线补发 | 适合(历史存数据库 + ajax 拉取, ws 只负责戳一下, 见 [`example/ReliableChat/`](example/ReliableChat/)) |
+| 大规模多节点分布式通知 | 需要额外改造(本库是单进程房间表)。看起来有办法解决、且全广播档不用改库,理论分析见 [`doc/multiNodeDistribute.md`](doc/multiNodeDistribute.md)(**仅理论,未实践**) |
+
+## CVersionId 还是 LiveData?
+
+`FireChange` 可选携带 `CVersionId` 和 `LiveData`, 两者语义不同, 对接时容易选错:
+
+| | 服务端存储 | 进房/重连 | 适合什么 |
+| --- | --- | --- | --- |
+| `CVersionId`(≤100 字节) | 存内存当前值 | 进房/重连自动下发当前值 | **当前状态量**("是什么"): 在线/typing、未读数、数据版本号 |
+| `LiveData`(≤1024 字节) | 不存, 仅实时传一次 | 重连/缓冲满/超限就没了 | **一次性增量**("发生了什么"): 新消息、streaming 文本片段 |
+
+- **状态量用 `CVersionId`**。它是"当前完整状态", 丢一次通知没关系——下一次通知或进房/重连会带上最新值, **自动收敛到正确状态**。
+  例如 typing / 在线状态: `FireChange(RoomId, CVersionId="在线状态编码")`, 客户端 `onChange` 直接读 `ev.CVersionId` 更新 UI, **不需要 ajax**;
+  只在服务器重启(`CVersionId` 丢失、`RoomEpoch` 变化)时用 ajax 取一次当前完整状态保底。100 字节放状态编码或版本号通常够用, 不够就用 `CVersionId` 当版本号 + ajax 取完整列表。
+- **一次性增量用 `LiveData`**。丢了(缓冲满/断线/超 1024)就走 ajax 补。聊天消息属于这类(每条是新增内容, 不是"当前状态"), 见 [`example/ReliableChat/`](example/ReliableChat/)。
+
+## 例子: 可靠聊天消息 + 离线消息/历史/断线补发
+
+很多人会问: 本框架能不能做"聊天消息可靠送达"和"离线消息/消息历史/回放/断线补发"?
+答案是可以——把 ws 当"戳一下"的低延迟通道, 把 ajax(或 http rpc)当真实数据来源, 两者配合即可。
+对接代码很简单, 代价仅仅是某些情况(LiveData 不够用时)多一个 RTT。
+
+核心思路(完整可运行代码 + 自动测试见 [`example/ReliableChat/`](example/ReliableChat/)):
+
+1. 真正的可靠性锚点是**业务消息序号**(每个房间内单调递增, 存数据库), 不是 ws 层的 `ChangeSeq`
+   (`ChangeSeq` 只是"戳一下"信号, 服务器重启会重置)。
+2. 服务端每来一条消息: 先写库分配序号, 再 `FireChange`, 把整条消息塞进 `LiveData`(尽力而为)。
+3. 客户端收到 onChange:
+   - `LiveData` 有内容, 且序号正好接在本地最后一条之后 → 直接用 `LiveData` 应用, **0 额外 RTT**(快路径, 即"直接推送每一条聊天消息")。
+   - 否则(`LiveData` 没有/被丢弃/超 1024 字节/重连/服务器重启, 或者序号跳号说明中间漏了)→ **ajax 拉取本地最后序号之后的全部消息**补齐。
+4. "是不是断过线"不需要单独判断: 任何中断都会表现为"`LiveData` 缺失"或"序号跳号", 被上面的 ajax 路径统一兜住。
+   这条 ajax 路径同时就是"离线消息/历史/回放/断线补发"的实现——新客户端进房、断线重连、服务器重启后, 都靠它把缺的消息补回来。
+
+运行例子: `go run ./example/ReliableChat`; 跑自动测试: `go test ./example/ReliableChat/`。
+自动测试覆盖: 逐条快路径送达、突发连发不丢消息、超大 `LiveData` 降级 ajax、进房回放历史、ws 重启后断线补发。
+
 ## License
 
-[Unlicense](https://unlicense.org/)(public domain),外加 SQLite 那段祝福。见 [LICENSE](LICENSE)
+[Unlicense](https://unlicense.org/)(public domain)
