@@ -14,6 +14,9 @@ export const hgmRn_Cmd_identity:number = 6
 export const hgmRn_Cmd_connAllow:number = 7
 export const hgmRn_Cmd_deny:number = 8
 export const hgmRn_Cmd_closeConn:number = 9
+// 大 LiveData 超过单 frame 时拆块传输(服务端->客户端): roomValueMore=后面还有, roomValueEof=最后一个(带元数据).
+export const hgmRn_Cmd_roomValueMore:number = 10
+export const hgmRn_Cmd_roomValueEof:number = 11
 export const hgmRn_DenyScope_conn:number = 1
 export const hgmRn_DenyScope_room:number = 2
 

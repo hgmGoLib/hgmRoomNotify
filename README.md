@@ -150,7 +150,8 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 
 - 二进制协议, 一个 WebSocket message 可以包含多个协议消息。
 - 每个协议消息格式: `[uint16LE 长度][消息体]`。
-- 消息类型: `ping(1)`, `setTimeCfg(2)`, `roomEnter(3)`, `roomLeave(4)`, `roomValue(5)`, `identity(6)`, `connAllow(7)`, `deny(8)`, `closeConn(9)`。
+- 消息类型: `ping(1)`, `setTimeCfg(2)`, `roomEnter(3)`, `roomLeave(4)`, `roomValue(5)`, `identity(6)`, `connAllow(7)`, `deny(8)`, `closeConn(9)`, `roomValueMore(10)`, `roomValueEof(11)`。
+  - `roomValueMore`/`roomValueEof`: 服务端->客户端。`LiveData` 超过单 frame 上限时, 一次 `roomValue` 拆成 `[roomValueMore...][roomValueEof]` 分块传输(More=后面还有, Eof=最后一个+元数据)。同连接上整组分片连续到达、中间不插其它消息, 客户端按顺序累积重组。
   - `identity`: 客户端->服务端首包(opaque 凭证)。
   - `connAllow`: 服务端->客户端连接已批准(携带 `AuthEnabled`)。
   - `deny`: 服务端->客户端拒绝(连接/房间)。
@@ -186,10 +187,14 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 
 ## 限制
 
-- `LiveData` 最大 1024 字节。超过 1024 字节的数据静默丢弃(不发送 `LiveData` 但通知仍然发出)。
+- `LiveData` 默认最大 1024 字节, 可由 `ServerManager.LiveDataMaxSize` 调大(最大 512MB)。超过该上限的数据静默丢弃(不发送 `LiveData` 但通知仍然发出)。
+  - `LiveDataMaxSize` 必须 ≤ `WriteBufMaxBytes`(每连接写缓冲, 默认 64KB, 最大 2GB)的 25%, 否则初始化时 panic。
+  - `LiveDataMaxSize`/`WriteBufMaxBytes` 必须在首次调用 API 前配置好, 之后不可更改(无锁读取)。
+  - 超过单 frame(约 64KB)的 `LiveData` 自动用 `roomValueMore`/`roomValueEof` 分块传输。**调大 `WriteBufMaxBytes` 时, 客户端的 `ReadMsgMaxBytes` 必须 ≥ 服务端 `WriteBufMaxBytes`**(单个 websocket message 最大可达该值), 否则客户端会因消息过大断开。默认值(两端 64KB)下行为与旧版完全一致。
+  - 注意: `LiveData` 越大, 越偏离"通知"定位, 热房间 fanout 下每条连接各缓存一份, 内存放大明显。大体积仅适合连接数少、低频的场景, 默认 1024 已覆盖绝大多数"一次性增量"需求。
 - `CVersionId` 最大 100 字节。超过会 panic。
 - `RoomId` 最大 1024 字节(服务端校验)。超过会断开连接。
-- 服务端单条协议消息最大 4096 字节(序列化后)。超过会断开连接。当前所有消息类型最大约 2420 字节, 在限制内。
+- 服务端单条协议消息(序列化后)最大 65535 字节(下层 frame 上限)。更大的 `LiveData` 通过分块跨多条消息传输。
 - 服务端不存储 `LiveData`, 客户端断线重连后不会补发之前的 `LiveData`。
 - 房间没有历史记录, 客户端只能收到订阅后的变更。
 

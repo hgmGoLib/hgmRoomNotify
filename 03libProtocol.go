@@ -36,6 +36,11 @@ const Cmd_identity Cmd_t = 6   // 客户端->服务端. 连接后首包. 携带 
 const Cmd_connAllow Cmd_t = 7  // 服务端->客户端. 连接已批准. 携带 AuthEnabled(服务端是否启用认证).
 const Cmd_deny Cmd_t = 8       // 服务端->客户端. 拒绝(连接或房间). DenyScope+RoomId+Reason.
 const Cmd_closeConn Cmd_t = 9  // 服务端->客户端. 要求客户端关闭连接. IsTemp+Reason.
+// LiveData 超过单 frame 上限时, 一次 roomValue 拆成 [roomValueMore...][roomValueEof] 分块传输(服务端->客户端).
+// roomValueMore 只携带一段 LiveData 分片(后面还有); roomValueEof 携带最后一段分片 + 全部 roomValue 元数据(最后一个).
+// 同一连接上一次分块序列由写缓冲原子整组写入, 中间不会插入其它消息, 客户端按到达顺序累积分片即可, 无需分片携带元数据.
+const Cmd_roomValueMore Cmd_t = 10 // 服务端->客户端. LiveData 分片, 后面还有. LiveData(分片) 有效.
+const Cmd_roomValueEof Cmd_t = 11  // 服务端->客户端. LiveData 最后一个分片. RoomId, RoomEpoch, ChangeSeq, CVersionId, LiveData(分片) 有效.
 
 // Cmd_deny 的 DenyScope 取值.
 type DenyScope_t = uint8
@@ -58,7 +63,7 @@ type Msg_t struct {
 	RoomEpoch    string // 房间纪元id. 每次房间被创建时由 zlibIdGen.NewId() 生成. 用于检测房间被重建(包括服务器重启).
 	ChangeSeq    uint64 // 变化序号. 同一个 RoomEpoch 下递增表示有新变化.
 	CVersionId   string // 自定义版本id. 服务器内存存储该数据. 调用者用于追踪实际数据变化. 最大100字节.
-	LiveData     []byte // 事件发生时的附加实时数据. 本模块不存储. 最大1024字节.
+	LiveData     []byte // 事件发生时的附加实时数据. 本模块不存储. 默认上限1024字节, 可由服务端 LiveDataMaxSize 调大(最大512MB). 超过单 frame 时拆分到 roomValueMore/roomValueEof.
 	TimeoutCfg   *TimeoutCfg_t
 	Identity     string    // Cmd_identity. opaque 凭证. 最大65535字节.
 	AuthEnabled  bool      // Cmd_connAllow. 服务端是否配置了认证(用于客户端"漏接 onDenyFn 当场告警").
@@ -73,6 +78,8 @@ type Msg_t struct {
 // Cmd_roomEnter:     [Cmd: uint8][RoomId: uint16LE长度 + 内容]
 // Cmd_roomLeave:     [Cmd: uint8][RoomId: uint16LE长度 + 内容]
 // Cmd_roomValue:     [Cmd: uint8][RoomId: uint16LE长度 + 内容][RoomEpoch: uint8长度 + 内容][ChangeSeq: uvarint][CVersionId: uint8长度 + 内容][LiveData: uint16LE长度 + 内容]
+// Cmd_roomValueMore: [Cmd: uint8][LiveData分片: uint16LE长度 + 内容]
+// Cmd_roomValueEof:  [Cmd: uint8][RoomId: uint16LE长度 + 内容][RoomEpoch: uint8长度 + 内容][ChangeSeq: uvarint][CVersionId: uint8长度 + 内容][LiveData分片: uint16LE长度 + 内容]
 // Cmd_identity:      [Cmd: uint8][Identity: uint16LE长度 + 内容]
 // Cmd_connAllow:     [Cmd: uint8][AuthEnabled: uint8]
 // Cmd_deny:          [Cmd: uint8][DenyScope: uint8][RoomId: uint16LE长度 + 内容][Reason: uint16LE长度 + 内容]
@@ -136,6 +143,25 @@ func (msg *Msg_t) BinarySize() (size int, errMsg string) {
 			return 0, "LiveData too long, max 65535 bytes, got " + strconv.Itoa(len(msg.LiveData))
 		}
 		return 1 + (2+len(msg.RoomId)) + (1+len(msg.RoomEpoch)) + getUvarintOutputSize(msg.ChangeSeq) + (1+len(msg.CVersionId)) + (2+len(msg.LiveData)), ""
+	case Cmd_roomValueMore:
+		if len(msg.LiveData) > 65535 {
+			return 0, "LiveData chunk too long, max 65535 bytes, got " + strconv.Itoa(len(msg.LiveData))
+		}
+		return 1 + (2+len(msg.LiveData)), ""
+	case Cmd_roomValueEof:
+		if len(msg.RoomId) > 65535 {
+			return 0, "RoomId too long, max 65535 bytes, got " + strconv.Itoa(len(msg.RoomId))
+		}
+		if len(msg.RoomEpoch) > 255 {
+			return 0, "RoomEpoch too long, max 255 bytes, got " + strconv.Itoa(len(msg.RoomEpoch))
+		}
+		if len(msg.CVersionId) > 255 {
+			return 0, "CVersionId too long, max 255 bytes, got " + strconv.Itoa(len(msg.CVersionId))
+		}
+		if len(msg.LiveData) > 65535 {
+			return 0, "LiveData chunk too long, max 65535 bytes, got " + strconv.Itoa(len(msg.LiveData))
+		}
+		return 1 + (2+len(msg.RoomId)) + (1+len(msg.RoomEpoch)) + getUvarintOutputSize(msg.ChangeSeq) + (1+len(msg.CVersionId)) + (2+len(msg.LiveData)), ""
 	default:
 		return 0, "unknown cmd " + strconv.Itoa(int(msg.Cmd))
 	}
@@ -197,6 +223,21 @@ func (msg *Msg_t) MarshalBinaryInto(buf []byte) {
 		pos += copy(buf[pos:], msg.CVersionId)
 		binary.LittleEndian.PutUint16(buf[pos:], uint16(len(msg.LiveData))); pos += 2
 		copy(buf[pos:], msg.LiveData)
+	case Cmd_roomValueMore:
+		pos := 1
+		binary.LittleEndian.PutUint16(buf[pos:], uint16(len(msg.LiveData))); pos += 2
+		copy(buf[pos:], msg.LiveData)
+	case Cmd_roomValueEof:
+		pos := 1
+		binary.LittleEndian.PutUint16(buf[pos:], uint16(len(msg.RoomId))); pos += 2
+		pos += copy(buf[pos:], msg.RoomId)
+		buf[pos] = uint8(len(msg.RoomEpoch)); pos++
+		pos += copy(buf[pos:], msg.RoomEpoch)
+		pos += binary.PutUvarint(buf[pos:], msg.ChangeSeq)
+		buf[pos] = uint8(len(msg.CVersionId)); pos++
+		pos += copy(buf[pos:], msg.CVersionId)
+		binary.LittleEndian.PutUint16(buf[pos:], uint16(len(msg.LiveData))); pos += 2
+		copy(buf[pos:], msg.LiveData)
 	}
 }
 
@@ -240,6 +281,19 @@ func (msg *Msg_t) MarshalBinaryTo(w *zlibBytes.BufWriter) {
 		w.WriteLittleEndUint16(uint16(len(msg.RoomId)))
 		w.WriteString_(msg.RoomId)
 	case Cmd_roomValue:
+		w.WriteLittleEndUint16(uint16(len(msg.RoomId)))
+		w.WriteString_(msg.RoomId)
+		w.WriteByte_(uint8(len(msg.RoomEpoch)))
+		w.WriteString_(msg.RoomEpoch)
+		w.WriteUvarint(msg.ChangeSeq)
+		w.WriteByte_(uint8(len(msg.CVersionId)))
+		w.WriteString_(msg.CVersionId)
+		w.WriteLittleEndUint16(uint16(len(msg.LiveData)))
+		w.Write_(msg.LiveData)
+	case Cmd_roomValueMore:
+		w.WriteLittleEndUint16(uint16(len(msg.LiveData)))
+		w.Write_(msg.LiveData)
+	case Cmd_roomValueEof:
 		w.WriteLittleEndUint16(uint16(len(msg.RoomId)))
 		w.WriteString_(msg.RoomId)
 		w.WriteByte_(uint8(len(msg.RoomEpoch)))
@@ -410,6 +464,72 @@ func UnmarshalMsg(data []byte) (msg Msg_t, errMsg string) {
 		if dataLen > 0 {
 			msg.LiveData = make([]byte, dataLen)
 			copy(msg.LiveData, data[pos:pos+dataLen])
+		}
+		return msg, ""
+	case Cmd_roomValueMore:
+		if pos+2 > len(data) {
+			return msg, "data too short for chunk len"
+		}
+		chunkLen := int(binary.LittleEndian.Uint16(data[pos:])); pos += 2
+		if pos+chunkLen > len(data) {
+			return msg, "chunk field overflow"
+		}
+		if chunkLen > 0 {
+			msg.LiveData = make([]byte, chunkLen)
+			copy(msg.LiveData, data[pos:pos+chunkLen])
+		}
+		return msg, ""
+	case Cmd_roomValueEof:
+		if pos+2 > len(data) {
+			return msg, "data too short for roomId len"
+		}
+		roomIdLen := int(binary.LittleEndian.Uint16(data[pos:])); pos += 2
+		if pos+roomIdLen > len(data) {
+			return msg, "roomId overflow"
+		}
+		if roomIdLen > 0 {
+			msg.RoomId = string(data[pos : pos+roomIdLen]); pos += roomIdLen
+		}
+
+		if pos+1 > len(data) {
+			return msg, "data too short for RoomEpoch len"
+		}
+		roomEpochLen := int(data[pos]); pos++
+		if pos+roomEpochLen > len(data) {
+			return msg, "RoomEpoch overflow"
+		}
+		if roomEpochLen > 0 {
+			msg.RoomEpoch = string(data[pos : pos+roomEpochLen]); pos += roomEpochLen
+		}
+
+		changeSeq, uvarintLen := binary.Uvarint(data[pos:])
+		if uvarintLen <= 0 {
+			return msg, "ChangeSeq uvarint decode fail"
+		}
+		msg.ChangeSeq = changeSeq
+		pos += uvarintLen
+
+		if pos+1 > len(data) {
+			return msg, "data too short for CVersionId len"
+		}
+		cVersionIdLen := int(data[pos]); pos++
+		if pos+cVersionIdLen > len(data) {
+			return msg, "CVersionId overflow"
+		}
+		if cVersionIdLen > 0 {
+			msg.CVersionId = string(data[pos : pos+cVersionIdLen]); pos += cVersionIdLen
+		}
+
+		if pos+2 > len(data) {
+			return msg, "data too short for chunk len"
+		}
+		chunkLen := int(binary.LittleEndian.Uint16(data[pos:])); pos += 2
+		if pos+chunkLen > len(data) {
+			return msg, "chunk field overflow"
+		}
+		if chunkLen > 0 {
+			msg.LiveData = make([]byte, chunkLen)
+			copy(msg.LiveData, data[pos:pos+chunkLen])
 		}
 		return msg, ""
 	default:

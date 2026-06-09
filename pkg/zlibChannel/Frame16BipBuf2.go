@@ -188,6 +188,24 @@ func (b *Frame16BipBuf2) PopReadFrame() []byte {
 	return b.Buf[cur+2 : end]
 }
 
+// 返回在不超过 MaxCap 的前提下, 还能用 AllocFrame 写入的总字节数(含每帧 2 字节长度头).
+// 调用者据此判断一组 frame 能否一次性原子写入: 当 sum(2+n_i) <= FreeForAlloc() 时,
+// 在同一把锁内(期间不发送)连续 AllocFrame 这组 frame 必定全部成功(grow 最多扩容到 MaxCap,
+// 且因不发送不会回绕, 始终连续). 据此实现"全部写入或全部不写入"的原子分块.
+func (b *Frame16BipBuf2) FreeForAlloc() uint32 {
+	var queueLen uint32
+	if b.TailEnd == 0 {
+		queueLen = b.Write - b.SendEnd
+	} else {
+		queueLen = (b.TailEnd - b.SendEnd) + (b.Write - b.Prefix)
+	}
+	used := b.Prefix + queueLen
+	if used >= b.MaxCap {
+		return 0
+	}
+	return b.MaxCap - used
+}
+
 // 清空缓冲区(不释放内存, 不缩容). 复位到 Prefix 基点.
 func (b *Frame16BipBuf2) Reset() {
 	b.Sent = b.Prefix

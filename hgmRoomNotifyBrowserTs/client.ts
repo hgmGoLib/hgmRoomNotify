@@ -27,6 +27,8 @@ import {
     hgmRn_Cmd_roomEnter,
     hgmRn_Cmd_roomLeave,
     hgmRn_Cmd_roomValue,
+    hgmRn_Cmd_roomValueMore,
+    hgmRn_Cmd_roomValueEof,
     hgmRn_Cmd_connAllow,
     hgmRn_Cmd_deny,
     hgmRn_Cmd_closeConn,
@@ -172,6 +174,9 @@ export class hgmRn_Client{
     private isConnThreadRunning=false
     private wsDialNum = 0;
     private isStopListen = false;
+    // 大 LiveData 分块重组缓冲. roomValueMore 累积分片, roomValueEof 拼出完整 LiveData 后清空. 每次新建连接时重置.
+    private _roomValueReassembleChunks: Uint8Array[] = []
+    private _roomValueReassembleLen = 0
     // 安全调用 onChangeFn, 捕获异常和 ErrMsg.
     private _callOnChangeFnSafe(fn:(ev:hgmRn_RoomOnChange_t)=>void, ev:hgmRn_RoomOnChange_t){
         this.onChangeRunningCount++
@@ -252,6 +257,8 @@ export class hgmRn_Client{
         // 连接超时
         this.wsDialTimer.reset(this.timeoutCfg.ClientWsDialTimeoutDur)
         this.socket = thisSocket;
+        this._roomValueReassembleChunks = []
+        this._roomValueReassembleLen = 0
         thisSocket.addEventListener("message",(event)=>{
             this._postRead()
             const data = new Uint8Array(event.data as ArrayBuffer)
@@ -344,61 +351,32 @@ export class hgmRn_Client{
             break
         }
         case hgmRn_Cmd_roomValue:{
-            let p = 1
-            const rv = hgmRn_readStr16LE(data,p)
+            // 单条完整 roomValue: [RoomId][RoomEpoch][ChangeSeq][CVersionId][LiveData]
+            const f = this._parseRoomValueFields(data,1)
+            if (f===null){ this._close_thisSocket("protocolError"); return }
+            this._onRoomValue(f.roomId,f.roomEpoch,f.changeSeq,f.cVersionId,f.chunk)
+            break
+        }
+        case hgmRn_Cmd_roomValueMore:{
+            // 累积一段 LiveData 分片(后面还有). [LiveData分片: uint16LE长度+内容]
+            const rv = hgmRn_readBytes16LE(data,1)
             if (rv===null){ this._close_thisSocket("protocolError"); return }
-            const roomId = rv.s; p = rv.pos
-            // RoomEpoch: uint8长度+内容
-            if (p+1>data.length){ this._close_thisSocket("protocolError"); return }
-            const roomEpochLen = data[p]; p++
-            if (p+roomEpochLen>data.length){ this._close_thisSocket("protocolError"); return }
-            const roomEpoch = roomEpochLen>0 ? hgmRn_decodeUtf8(data.subarray(p,p+roomEpochLen)) : ""
-            p+=roomEpochLen
-            // ChangeSeq: uvarint
-            const uvr = hgmRn_readUvarint(data,p)
-            if (uvr===null){ this._close_thisSocket("protocolError"); return }
-            const changeSeq = uvr.value; p = uvr.pos
-            // CVersionId: uint8长度+内容
-            if (p+1>data.length){ this._close_thisSocket("protocolError"); return }
-            const cVersionIdLen = data[p]; p++
-            if (p+cVersionIdLen>data.length){ this._close_thisSocket("protocolError"); return }
-            const cVersionId = cVersionIdLen>0 ? hgmRn_decodeUtf8(data.subarray(p,p+cVersionIdLen)) : ""
-            p+=cVersionIdLen
-            // LiveData: uint16LE长度+内容
-            const rv3 = hgmRn_readBytes16LE(data,p)
-            if (rv3===null){ this._close_thisSocket("protocolError"); return }
-            const liveData = rv3.bytes
-
-            const room = this.roomMap.get(roomId)
-            if (room===undefined){
-                return
-            }
-            if (roomEpoch!==room.RoomEpoch){
-                // 房间纪元变了(房间被重建或服务器重启), 无条件接受.
-                room.RoomEpoch = roomEpoch
-                room.ChangeSeq = changeSeq
-                room.CVersionId = cVersionId
-            }else if (changeSeq>room.ChangeSeq){
-                // 同纪元有新变化.
-                room.ChangeSeq = changeSeq
-                room.CVersionId = cVersionId
-            }else{
-                // 旧消息(竞争产生的), 整条忽略.
-                return
-            }
-            const ev:hgmRn_RoomOnChange_t = {
-                RoomId: roomId,
-                RoomEpoch: room.RoomEpoch,
-                ChangeSeq: room.ChangeSeq,
-                CVersionId: room.CVersionId,
-                LiveData: liveData.length>0 ? liveData : null,
-                ErrMsg: "",
-            }
-            // 复制一份, 避免回调中调用 leaveFn 修改 onChangeSet 导致迭代异常.
-            const cbList = [...room.onChangeSet]
-            for (const cb of cbList){
-                this._callOnChangeFnSafe(cb,ev)
-            }
+            this._roomValueReassembleChunks.push(rv.bytes)
+            this._roomValueReassembleLen += rv.bytes.length
+            break
+        }
+        case hgmRn_Cmd_roomValueEof:{
+            // 最后一个分片 + 元数据. 拼出完整 LiveData 后通知, 并清空重组缓冲.
+            const f = this._parseRoomValueFields(data,1)
+            if (f===null){ this._close_thisSocket("protocolError"); return }
+            this._roomValueReassembleChunks.push(f.chunk)
+            this._roomValueReassembleLen += f.chunk.length
+            const full = new Uint8Array(this._roomValueReassembleLen)
+            let off = 0
+            for (const c of this._roomValueReassembleChunks){ full.set(c,off); off += c.length }
+            this._roomValueReassembleChunks = []
+            this._roomValueReassembleLen = 0
+            this._onRoomValue(f.roomId,f.roomEpoch,f.changeSeq,f.cVersionId,full)
             break
         }
         case hgmRn_Cmd_connAllow:{
@@ -459,6 +437,66 @@ export class hgmRn_Client{
             }
             break
         }
+        }
+    }
+    // 解析 roomValue/roomValueEof 的元数据+数据字段: [RoomId][RoomEpoch][ChangeSeq][CVersionId][LiveData/分片]. 失败返回 null.
+    _parseRoomValueFields(data:Uint8Array,startPos:number):{roomId:string,roomEpoch:string,changeSeq:number,cVersionId:string,chunk:Uint8Array}|null{
+        let p = startPos
+        const rv = hgmRn_readStr16LE(data,p)
+        if (rv===null){ return null }
+        const roomId = rv.s; p = rv.pos
+        // RoomEpoch: uint8长度+内容
+        if (p+1>data.length){ return null }
+        const roomEpochLen = data[p]; p++
+        if (p+roomEpochLen>data.length){ return null }
+        const roomEpoch = roomEpochLen>0 ? hgmRn_decodeUtf8(data.subarray(p,p+roomEpochLen)) : ""
+        p+=roomEpochLen
+        // ChangeSeq: uvarint
+        const uvr = hgmRn_readUvarint(data,p)
+        if (uvr===null){ return null }
+        const changeSeq = uvr.value; p = uvr.pos
+        // CVersionId: uint8长度+内容
+        if (p+1>data.length){ return null }
+        const cVersionIdLen = data[p]; p++
+        if (p+cVersionIdLen>data.length){ return null }
+        const cVersionId = cVersionIdLen>0 ? hgmRn_decodeUtf8(data.subarray(p,p+cVersionIdLen)) : ""
+        p+=cVersionIdLen
+        // LiveData/分片: uint16LE长度+内容
+        const rv3 = hgmRn_readBytes16LE(data,p)
+        if (rv3===null){ return null }
+        return {roomId,roomEpoch,changeSeq,cVersionId,chunk:rv3.bytes}
+    }
+    // 收到一次完整 roomValue(单条, 或分块重组后)后更新房间状态并通知 onChange 回调.
+    _onRoomValue(roomId:string,roomEpoch:string,changeSeq:number,cVersionId:string,liveData:Uint8Array){
+        const room = this.roomMap.get(roomId)
+        if (room===undefined){
+            return
+        }
+        if (roomEpoch!==room.RoomEpoch){
+            // 房间纪元变了(房间被重建或服务器重启), 无条件接受.
+            room.RoomEpoch = roomEpoch
+            room.ChangeSeq = changeSeq
+            room.CVersionId = cVersionId
+        }else if (changeSeq>room.ChangeSeq){
+            // 同纪元有新变化.
+            room.ChangeSeq = changeSeq
+            room.CVersionId = cVersionId
+        }else{
+            // 旧消息(竞争产生的), 整条忽略.
+            return
+        }
+        const ev:hgmRn_RoomOnChange_t = {
+            RoomId: roomId,
+            RoomEpoch: room.RoomEpoch,
+            ChangeSeq: room.ChangeSeq,
+            CVersionId: room.CVersionId,
+            LiveData: liveData.length>0 ? liveData : null,
+            ErrMsg: "",
+        }
+        // 复制一份, 避免回调中调用 leaveFn 修改 onChangeSet 导致迭代异常.
+        const cbList = [...room.onChangeSet]
+        for (const cb of cbList){
+            this._callOnChangeFnSafe(cb,ev)
         }
     }
     _close_thisSocket(reason?: string){

@@ -79,6 +79,42 @@ func (c *Client) RoomEnter(roomId string,onChangeFn func(ev *RoomOnChange_t)) (l
 	}
 }
 
+// 收到一次完整 roomValue(单条 Cmd_roomValue, 或分块重组后的结果)后, 更新房间状态并通知 listener.
+// liveData 为本次完整的实时数据(可能为空).
+func (c *Client) onRoomValue(roomId string, roomEpoch string, changeSeq uint64, cVersionId string, liveData []byte){
+	c.roomLock.Lock()
+	room,hasRoom:=c.roomMap[roomId]
+	if hasRoom==false{
+		c.roomLock.Unlock()
+		return
+	}
+	if roomEpoch!=room.RoomEpoch{
+		// 房间纪元变了(房间被重建或服务器重启), 无条件接受.
+		room.RoomEpoch = roomEpoch
+		room.ChangeSeq = changeSeq
+		room.CVersionId = cVersionId
+	}else if changeSeq>room.ChangeSeq{
+		// 同纪元有新变化.
+		room.ChangeSeq = changeSeq
+		room.CVersionId = cVersionId
+	}else{
+		// 旧消息(竞争产生的), 整条忽略.
+		c.roomLock.Unlock()
+		return
+	}
+	ev:=RoomOnChange_t{
+		RoomId:     roomId,
+		RoomEpoch:  room.RoomEpoch,
+		ChangeSeq:  room.ChangeSeq,
+		CVersionId: room.CVersionId,
+		LiveData:   liveData,
+	}
+	for listener:=range room.listenerSet{
+		listener.onChangeAsync(ev)
+	}
+	c.roomLock.Unlock()
+}
+
 type client_room_t struct{
 	RoomEpoch    string // 房间纪元id. 用于检测房间重建.
 	ChangeSeq    uint64 // 变化序号. 同一个RoomEpoch下递增表示有新变化.

@@ -30,7 +30,9 @@ func (wb *server_conn_write_buf_t) pushMsg(msg Msg_t) pushMsgResult_t {
 	if errMsg != "" {
 		return pushMsgResult_msgTooLarge
 	}
-	if msgSize > 4096 {
+	// 单条 frame 的硬上限是 BipBuf AllocFrame 的 uint16(65535). 超过 frame 上限的大 LiveData 由
+	// pushMsgsAtomic 拆成 roomValueMore/roomValueEof 多条, 不会走到这里.
+	if msgSize > 65535 {
 		return pushMsgResult_msgTooLarge
 	}
 	wb.mu.Lock()
@@ -44,6 +46,47 @@ func (wb *server_conn_write_buf_t) pushMsg(msg Msg_t) pushMsgResult_t {
 		return pushMsgResult_bufFull
 	}
 	msg.MarshalBinaryInto(buf)
+	if !wb.writerRunning {
+		wb.writerRunning = true
+		go wb.writeLoop()
+	}
+	wb.mu.Unlock()
+	return pushMsgResult_ok
+}
+
+// 将一组消息原子追加到写入缓冲: 要么全部写入, 要么一条不写(返回 bufFull/msgTooLarge).
+// 用于把一次大 LiveData 拆成的 roomValueMore...roomValueEof 序列整组写入, 保证中间不被其它消息插入,
+// 客户端按到达顺序累积分片即可重组. 原子性依赖: 整组在同一把锁内连续 AllocFrame(期间 writeLoop 不会发送),
+// 且事先用 FreeForAlloc 预检总容量, 使每次 AllocFrame 必定成功且不回绕.
+func (wb *server_conn_write_buf_t) pushMsgsAtomic(msgs []Msg_t) pushMsgResult_t {
+	sizes := make([]int, len(msgs))
+	var total uint32
+	for i := range msgs {
+		msgSize, errMsg := msgs[i].BinarySize()
+		if errMsg != "" || msgSize > 65535 {
+			return pushMsgResult_msgTooLarge
+		}
+		sizes[i] = msgSize
+		total += 2 + uint32(msgSize)
+	}
+	wb.mu.Lock()
+	if wb.isBroken {
+		wb.mu.Unlock()
+		return pushMsgResult_broken
+	}
+	if total > wb.bipBuf.FreeForAlloc() {
+		wb.mu.Unlock()
+		return pushMsgResult_bufFull
+	}
+	for i := range msgs {
+		buf := wb.bipBuf.AllocFrame(uint16(sizes[i]))
+		if buf == nil {
+			// 已用 FreeForAlloc 预检, 理论上不会发生; 真发生则前面的分片已入队但无 Eof, 连接随后被关闭, 客户端整条丢弃.
+			wb.mu.Unlock()
+			return pushMsgResult_bufFull
+		}
+		msgs[i].MarshalBinaryInto(buf)
+	}
 	if !wb.writerRunning {
 		wb.writerRunning = true
 		go wb.writeLoop()
