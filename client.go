@@ -120,7 +120,7 @@ type client_conn struct {
 	connApproved     bool // 仅在 authResolvedCh 关闭后由主 goroutine 读取.
 	connDenied       bool
 
-	// 大 LiveData 分块重组缓冲. roomValueMore 累积分片, roomValueEof 拼出完整 LiveData 后清空.
+	// 大 LiveData 分块重组缓冲. roomValueMore 累积分片, 末条 roomValue 拼出完整 LiveData 后清空.
 	// 仅在本连接的 readThread 单 goroutine 内读写, 无需加锁. 连接重建时随 client_conn 一起丢弃.
 	roomValueReassembleBuf []byte
 }
@@ -292,7 +292,14 @@ func (c *Client) tryConnOnceSync() (isContinue bool){
 				c.TimeoutCfg.Set(*cfg)
 			}
 		case Cmd_roomValue:
-			c.onRoomValue(msg.RoomId, msg.RoomEpoch, msg.ChangeSeq, msg.CVersionId, msg.LiveData)
+			// 前面有 roomValueMore 累积分片时, 本条即为分块序列的最后一片, 把累积分片拼到它前面;
+			// 没有累积分片时(常见的不分块情形)直接用本条 LiveData, 零额外拷贝.
+			liveData := msg.LiveData
+			if thisConn.roomValueReassembleBuf != nil {
+				liveData = append(thisConn.roomValueReassembleBuf, msg.LiveData...)
+				thisConn.roomValueReassembleBuf = nil
+			}
+			c.onRoomValue(msg.RoomId, msg.RoomEpoch, msg.ChangeSeq, msg.CVersionId, liveData)
 		case Cmd_roomValueMore:
 			// 累积一段 LiveData 分片. 上限 = ReadMsgMaxBytes(整组分片本就在单个 websocket message 内, 不会超).
 			reassembleMax := c.ReadMsgMaxBytes
@@ -305,10 +312,6 @@ func (c *Client) tryConnOnceSync() (isContinue bool){
 				return
 			}
 			thisConn.roomValueReassembleBuf = append(thisConn.roomValueReassembleBuf, msg.LiveData...)
-		case Cmd_roomValueEof:
-			full := append(thisConn.roomValueReassembleBuf, msg.LiveData...)
-			thisConn.roomValueReassembleBuf = nil
-			c.onRoomValue(msg.RoomId, msg.RoomEpoch, msg.ChangeSeq, msg.CVersionId, full)
 		case Cmd_connAllow:
 			// 连接被批准. 清掉连接级 deny 状态(重连重新认证通过), 唤醒主 goroutine 去发 roomEnter.
 			c.connDenyLocal.Set(false)

@@ -39,7 +39,7 @@ type ServerManager struct{
 	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再读取也不可更改(无锁/无atomic).
 	WriteBufMaxBytes int
 	// 单次 LiveData 最大字节数. 0表示使用默认值1024, 最大可配置 512MB. 超过则该次 FireChange 的 LiveData 被静默丢弃(发 obs).
-	// 必须 <= WriteBufMaxBytes 的 25%, 否则 _init 时 panic. 超过单 frame 上限时自动用 roomValueMore/roomValueEof 分块传输.
+	// 必须 <= WriteBufMaxBytes 的 25%, 否则 _init 时 panic. 超过单 frame 上限时自动用 roomValueMore...roomValue 分块传输.
 	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再读取也不可更改(无锁/无atomic).
 	LiveDataMaxSize int
 

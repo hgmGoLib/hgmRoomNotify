@@ -31,7 +31,7 @@ func (wb *server_conn_write_buf_t) pushMsg(msg Msg_t) pushMsgResult_t {
 		return pushMsgResult_msgTooLarge
 	}
 	// 单条 frame 的硬上限是 BipBuf AllocFrame 的 uint16(65535). 超过 frame 上限的大 LiveData 由
-	// pushMsgsAtomic 拆成 roomValueMore/roomValueEof 多条, 不会走到这里.
+	// pushMsgsAtomic 拆成 roomValueMore...roomValue 多条, 不会走到这里.
 	if msgSize > 65535 {
 		return pushMsgResult_msgTooLarge
 	}
@@ -55,7 +55,7 @@ func (wb *server_conn_write_buf_t) pushMsg(msg Msg_t) pushMsgResult_t {
 }
 
 // 将一组消息原子追加到写入缓冲: 要么全部写入, 要么一条不写(返回 bufFull/msgTooLarge).
-// 用于把一次大 LiveData 拆成的 roomValueMore...roomValueEof 序列整组写入, 保证中间不被其它消息插入,
+// 用于把一次大 LiveData 拆成的 roomValueMore...roomValue 序列整组写入, 保证中间不被其它消息插入,
 // 客户端按到达顺序累积分片即可重组. 原子性依赖: 整组在同一把锁内连续 AllocFrame(期间 writeLoop 不会发送),
 // 且事先用 FreeForAlloc 预检总容量, 使每次 AllocFrame 必定成功且不回绕.
 func (wb *server_conn_write_buf_t) pushMsgsAtomic(msgs []Msg_t) pushMsgResult_t {
