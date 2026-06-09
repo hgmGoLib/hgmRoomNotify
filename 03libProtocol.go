@@ -62,7 +62,7 @@ type Msg_t struct {
 	RoomEpoch    string // 房间纪元id. 每次房间被创建时由 zlibIdGen.NewId() 生成. 用于检测房间被重建(包括服务器重启).
 	ChangeSeq    uint64 // 变化序号. 同一个 RoomEpoch 下递增表示有新变化.
 	CVersionId   string // 自定义版本id. 服务器内存存储该数据. 调用者用于追踪实际数据变化. 最大100字节.
-	LiveData     []byte // 事件发生时的附加实时数据. 本模块不存储. 默认上限1024字节, 可由服务端 LiveDataMaxSize 调大(最大512MB). 超过单 frame 时拆分为 roomValueMore...roomValue.
+	LiveData     []byte // 事件发生时的附加实时数据. 本模块不存储. 默认上限1024字节, 可由服务端 LiveDataMaxSize 调大(最大16MB). 超过单 frame 时拆分为 roomValueMore...roomValue.
 	TimeoutCfg   *TimeoutCfg_t
 	Identity     string    // Cmd_identity. opaque 凭证. 最大65535字节.
 	AuthEnabled  bool      // Cmd_connAllow. 服务端是否配置了认证(用于客户端"漏接 onDenyFn 当场告警").

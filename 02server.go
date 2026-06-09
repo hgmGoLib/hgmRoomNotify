@@ -34,18 +34,14 @@ type ServerManager struct{
 	ObsFn func(ev *ObsEvent_t)
 	// 单连接最大房间数. 0表示使用默认值1024. 超过上限会给客户端报错并断开连接.
 	RoomEnterMaxPerConn int
-	// 写入缓冲最大字节数(每条连接). 0表示使用默认值64KB, 最大可配置 2GB. 调用者发现缓冲满了服务端主动断开连接.
+	// 写入缓冲最大字节数(每条连接). 0表示使用默认值64KB, 最大可配置 64MB. 调用者发现缓冲满了服务端主动断开连接.
 	// 注意: 调大后客户端的 ReadMsgMaxBytes 必须 >= 本值(单个 websocket message 最大可达本值), 否则客户端会因消息过大断开.
-	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再读取也不可更改(无锁/无atomic).
+	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再更改(并发安全靠此文档约束, 不加锁/atomic).
 	WriteBufMaxBytes int
-	// 单次 LiveData 最大字节数. 0表示使用默认值1024, 最大可配置 512MB. 超过则该次 FireChange 的 LiveData 被静默丢弃(发 obs).
+	// 单次 LiveData 最大字节数. 0表示使用默认值1024, 最大可配置 16MB. 超过则该次 FireChange 的 LiveData 被静默丢弃(发 obs).
 	// 必须 <= WriteBufMaxBytes 的 25%, 否则 _init 时 panic. 超过单 frame 上限时自动用 roomValueMore...roomValue 分块传输.
-	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再读取也不可更改(无锁/无atomic).
+	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再更改(并发安全靠此文档约束, 不加锁/atomic).
 	LiveDataMaxSize int
-
-	// _init 时按上面两个配置解析出的实际生效值(含默认值与上限校验), 之后只读.
-	writeBufMaxBytesResolved int
-	liveDataMaxSizeResolved  int
 
 	connCount atomic.Int64
 	roomMapLock sync.Mutex
@@ -99,34 +95,26 @@ type room_t struct {
 	CVersionId string // 自定义版本id. 调用者通过RoomEvent_t.CVersionId设置.
 	emptyTime time.Time // connSet为空时的时间. 零值表示非空.
 }
-// LiveData/写缓冲 配置上限.
-const serverWriteBufDefaultBytes = 64 * 1024              // 写缓冲默认 64KB.
-const serverWriteBufMaxBytesLimit = 2 * 1024 * 1024 * 1024 // 写缓冲最大 2GB.
-const serverLiveDataDefaultSize = 1024                    // LiveData 默认上限 1024 字节.
-const serverLiveDataMaxSizeLimit = 512 * 1024 * 1024      // LiveData 最大上限 512MB.
-
 func (s *ServerManager) _init(){
 	s.initOnce.Do(func(){
 		bufMax := s.WriteBufMaxBytes
 		if bufMax <= 0 {
-			bufMax = serverWriteBufDefaultBytes
+			bufMax = 64 * 1024 // 写缓冲默认 64KB.
 		}
-		if bufMax > serverWriteBufMaxBytesLimit {
-			panic("hgmRoomNotify: WriteBufMaxBytes too large, max 2GB, got " + strconv.Itoa(s.WriteBufMaxBytes))
+		if bufMax > 64*1024*1024 { // 写缓冲最大 64MB.
+			panic("hgmRoomNotify: WriteBufMaxBytes too large, max 64MB, got " + strconv.Itoa(s.WriteBufMaxBytes))
 		}
 		liveMax := s.LiveDataMaxSize
 		if liveMax <= 0 {
-			liveMax = serverLiveDataDefaultSize
+			liveMax = 1024 // LiveData 默认上限 1024 字节.
 		}
-		if liveMax > serverLiveDataMaxSizeLimit {
-			panic("hgmRoomNotify: LiveDataMaxSize too large, max 512MB, got " + strconv.Itoa(s.LiveDataMaxSize))
+		if liveMax > 16*1024*1024 { // LiveData 最大上限 16MB.
+			panic("hgmRoomNotify: LiveDataMaxSize too large, max 16MB, got " + strconv.Itoa(s.LiveDataMaxSize))
 		}
 		// LiveData 上限不能超过写缓冲的 25%(否则单条大 LiveData 容易撑满缓冲导致断连).
 		if liveMax > bufMax/4 {
 			panic("hgmRoomNotify: LiveDataMaxSize(" + strconv.Itoa(liveMax) + ") must be <= 25% of WriteBufMaxBytes(" + strconv.Itoa(bufMax) + ")")
 		}
-		s.writeBufMaxBytesResolved = bufMax
-		s.liveDataMaxSizeResolved = liveMax
 		s.TimeoutCfg.LockCb(func(t *TimeoutCfg_t) {
 			t.InitWithDefault()
 		})
@@ -181,7 +169,10 @@ func (s *ServerManager) ServeHTTP(w http.ResponseWriter, r *http.Request){
 		http.Error(w, ctx3.ErrMsg, 400)
 		return
 	}
-	maxBufBytes:=s.writeBufMaxBytesResolved
+	maxBufBytes:=s.WriteBufMaxBytes
+	if maxBufBytes<=0{
+		maxBufBytes = 64 * 1024 // 写缓冲默认 64KB.
+	}
 	useAuthQueue := s.OnAllowFn != nil
 	sconn :=&server_conn_t{
 		roomMap:         map[string]*room_t{},
@@ -384,10 +375,14 @@ func (s *ServerManager) FireChange(ev RoomEvent_t){
 	if len(ev.CVersionId) > 100 {
 		panic("hgmRoomNotify: CVersionId too long, max 100 bytes, got " + strconv.Itoa(len(ev.CVersionId)))
 	}
+	liveMax:=s.LiveDataMaxSize
+	if liveMax<=0{
+		liveMax = 1024 // LiveData 默认上限 1024 字节.
+	}
 	var liveBuf []byte
-	if len(ev.LiveData) > 0 && len(ev.LiveData) <= s.liveDataMaxSizeResolved {
+	if len(ev.LiveData) > 0 && len(ev.LiveData) <= liveMax {
 		liveBuf = ev.LiveData
-	} else if len(ev.LiveData) > s.liveDataMaxSizeResolved {
+	} else if len(ev.LiveData) > liveMax {
 		_emitObs(s.ObsFn, func(oev *ObsEvent_t) {
 			oev.Type = ObsEventType_serverLiveDataDropped
 			oev.RoomId = ev.RoomId

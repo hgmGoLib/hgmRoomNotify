@@ -187,8 +187,8 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 
 ## 限制
 
-- `LiveData` 默认最大 1024 字节, 可由 `ServerManager.LiveDataMaxSize` 调大(最大 512MB)。超过该上限的数据静默丢弃(不发送 `LiveData` 但通知仍然发出)。
-  - `LiveDataMaxSize` 必须 ≤ `WriteBufMaxBytes`(每连接写缓冲, 默认 64KB, 最大 2GB)的 25%, 否则初始化时 panic。
+- `LiveData` 默认最大 1024 字节, 可由 `ServerManager.LiveDataMaxSize` 调大(最大 16MB)。超过该上限的数据静默丢弃(不发送 `LiveData` 但通知仍然发出)。
+  - `LiveDataMaxSize` 必须 ≤ `WriteBufMaxBytes`(每连接写缓冲, 默认 64KB, 最大 64MB)的 25%, 否则初始化时 panic。
   - `LiveDataMaxSize`/`WriteBufMaxBytes` 必须在首次调用 API 前配置好, 之后不可更改(无锁读取)。
   - 超过单 frame(约 64KB)的 `LiveData` 自动用 `roomValueMore`...`roomValue` 分块传输。**调大 `WriteBufMaxBytes` 时, 客户端的 `ReadMsgMaxBytes` 必须 ≥ 服务端 `WriteBufMaxBytes`**(单个 websocket message 最大可达该值), 否则客户端会因消息过大断开。默认值(两端 64KB)下行为与旧版完全一致。
   - 注意: `LiveData` 越大, 越偏离"通知"定位, 热房间 fanout 下每条连接各缓存一份, 内存放大明显。大体积仅适合连接数少、低频的场景, 默认 1024 已覆盖绝大多数"一次性增量"需求。
