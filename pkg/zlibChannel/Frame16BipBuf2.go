@@ -149,9 +149,11 @@ func (b *Frame16BipBuf2) TakeSendSlice() []byte {
 	}
 	if b.TailEnd > 0 {
 		// 回绕未发完的尾段: 不授予 Suffix(其后是已写入的头段待发数据).
+		// 三索引把 cap 钉到 end, 使 cap-len==0, 下层据此知道本批没有 Suffix 空白(走 copy 回退),
+		// 不会越过 end 写进其后的未发送数据.
 		end := b.frameAlignedEnd(b.Sent, b.TailEnd)
 		b.SendEnd = end
-		return b.Buf[b.Sent-b.Prefix : end]
+		return b.Buf[b.Sent-b.Prefix : end : end]
 	}
 	if b.Sent < b.Write {
 		end := b.frameAlignedEnd(b.Sent, b.Write)
@@ -162,7 +164,8 @@ func (b *Frame16BipBuf2) TakeSendSlice() []byte {
 			b.pendingGap = b.Suffix // 下次取走时确认并跳过这段 gap
 			return b.Buf[b.Sent-b.Prefix : end : end+b.Suffix]
 		}
-		return b.Buf[b.Sent-b.Prefix : end]
+		// 未授予 Suffix: 三索引把 cap 钉到 end, cap-len==0, 下层不会越过 end 写进未发送数据.
+		return b.Buf[b.Sent-b.Prefix : end : end]
 	}
 	// 排空, 复位到 Prefix 基点.
 	b.Sent = b.Prefix
