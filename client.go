@@ -1,6 +1,7 @@
 package hgmRoomNotify
 
 import (
+	"strconv"
 	"sync"
 	"time"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibSync"
@@ -45,7 +46,8 @@ type Client struct {
 	TimeoutCfg zlibSync.Var[TimeoutCfg_t]
 	// 观测事件回调. nil 表示使用 ObsDefaultFn. 设置为空函数表示关闭观测.
 	ObsFn func(ev *ObsEvent_t)
-	// websocket message 最大读取字节数. 0表示使用默认值64KB.
+	// websocket message 最大读取字节数. 0表示使用默认值64KB, 负值 panic(_init 会把默认值写回本字段).
+	// 必须 >= 服务端 WriteBufMaxBytes(单个 websocket message 最大可达该值), 否则会因消息过大断开.
 	ReadMsgMaxBytes int
 
 	thisConn atomic.Pointer[client_conn]
@@ -136,6 +138,13 @@ func (c *Client) _init_afterEnter(){
 	c.connSingleUnd.Do(func() {
 		// 这个里面阻塞等待连接关闭.
 		c.initOnce.Do(func() {
+			// ReadMsgMaxBytes: 0 把默认 64KB 写回字段本身, 负值是调用者 bug 直接 panic. 之后读取点直接读字段.
+			if c.ReadMsgMaxBytes < 0 {
+				panic("hgmRoomNotify: Client.ReadMsgMaxBytes must not be negative, got " + strconv.Itoa(c.ReadMsgMaxBytes))
+			}
+			if c.ReadMsgMaxBytes == 0 {
+				c.ReadMsgMaxBytes = 64 * 1024 // 默认 64KB.
+			}
 			c.TimeoutCfg.LockCb(func(t *TimeoutCfg_t) {
 				t.InitWithDefault()
 			})
@@ -226,11 +235,7 @@ func (c *Client) tryConnOnceSync() (isContinue bool){
 		return true
 	}
 	c.logStatus(ClientStatus_connected)
-	clientMaxRead:=c.ReadMsgMaxBytes
-	if clientMaxRead<=0{
-		clientMaxRead = 64*1024
-	}
-	ctx3.Conn.MaxReadMsgSize = uint32(clientMaxRead)
+	ctx3.Conn.MaxReadMsgSize = uint32(c.ReadMsgMaxBytes)
 	thisConn:=&client_conn{
 		conn: conn_frame_t{raw: &ctx3.Conn},
 		c:    c,
@@ -302,11 +307,7 @@ func (c *Client) tryConnOnceSync() (isContinue bool){
 			c.onRoomValue(msg.RoomId, msg.RoomEpoch, msg.ChangeSeq, msg.CVersionId, liveData)
 		case Cmd_roomValueMore:
 			// 累积一段 LiveData 分片. 上限 = ReadMsgMaxBytes(整组分片本就在单个 websocket message 内, 不会超).
-			reassembleMax := c.ReadMsgMaxBytes
-			if reassembleMax<=0{
-				reassembleMax = 64*1024
-			}
-			if len(thisConn.roomValueReassembleBuf)+len(msg.LiveData) > reassembleMax{
+			if len(thisConn.roomValueReassembleBuf)+len(msg.LiveData) > c.ReadMsgMaxBytes{
 				c.logClose(CloseReason_protocolNoMatch, "roomValue reassemble overflow")
 				thisConn.conn.closer.Close2()
 				return

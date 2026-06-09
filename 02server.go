@@ -32,15 +32,15 @@ type ServerManager struct{
 	OnAllowFn func(ctx *ServerOnAllow_ctx_t)
 	// 观测事件回调. nil 表示使用 ObsDefaultFn. 设置为空函数表示关闭观测.
 	ObsFn func(ev *ObsEvent_t)
-	// 单连接最大房间数. 0表示使用默认值1024. 超过上限会给客户端报错并断开连接.
+	// 单连接最大房间数. 0表示使用默认值1024, 负值 _init 时 panic. 超过上限会给客户端报错并断开连接.
 	RoomEnterMaxPerConn int
-	// 写入缓冲最大字节数(每条连接). 0表示使用默认值64KB, 最大可配置 64MB. 调用者发现缓冲满了服务端主动断开连接.
+	// 写入缓冲最大字节数(每条连接). 0表示使用默认值64KB, 最大可配置 64MB(负值或超限 _init 时 panic). 调用者发现缓冲满了服务端主动断开连接.
 	// 注意: 调大后客户端的 ReadMsgMaxBytes 必须 >= 本值(单个 websocket message 最大可达本值), 否则客户端会因消息过大断开.
-	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再更改(并发安全靠此文档约束, 不加锁/atomic).
+	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再更改(并发安全靠此文档约束, 不加锁/atomic; _init 会把默认值写回本字段).
 	WriteBufMaxBytes int
-	// 单次 LiveData 最大字节数. 0表示使用默认值1024, 最大可配置 16MB. 超过则该次 FireChange 的 LiveData 被静默丢弃(发 obs).
+	// 单次 LiveData 最大字节数. 0表示使用默认值1024, 最大可配置 16MB(负值或超限 _init 时 panic). 超过则该次 FireChange 的 LiveData 被静默丢弃(发 obs).
 	// 必须 <= WriteBufMaxBytes 的 25%, 否则 _init 时 panic. 超过单 frame 上限时自动用 roomValueMore...roomValue 分块传输.
-	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再更改(并发安全靠此文档约束, 不加锁/atomic).
+	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再更改(并发安全靠此文档约束, 不加锁/atomic; _init 会把默认值写回本字段).
 	LiveDataMaxSize int
 
 	connCount atomic.Int64
@@ -97,23 +97,35 @@ type room_t struct {
 }
 func (s *ServerManager) _init(){
 	s.initOnce.Do(func(){
-		bufMax := s.WriteBufMaxBytes
-		if bufMax <= 0 {
-			bufMax = 64 * 1024 // 写缓冲默认 64KB.
+		// 三个 "0=默认值" 的 int 配置: 负值是调用者 bug 直接 panic(不能把负值静默当默认值, 会掩盖错误);
+		// 为 0 则把默认值写回字段本身, 之后所有读取点直接读字段, 不再各自处理默认值.
+		if s.WriteBufMaxBytes < 0 {
+			panic("hgmRoomNotify: WriteBufMaxBytes must not be negative, got " + strconv.Itoa(s.WriteBufMaxBytes))
 		}
-		if bufMax > 64*1024*1024 { // 写缓冲最大 64MB.
+		if s.WriteBufMaxBytes == 0 {
+			s.WriteBufMaxBytes = 64 * 1024 // 默认 64KB.
+		}
+		if s.WriteBufMaxBytes > 64*1024*1024 { // 最大 64MB.
 			panic("hgmRoomNotify: WriteBufMaxBytes too large, max 64MB, got " + strconv.Itoa(s.WriteBufMaxBytes))
 		}
-		liveMax := s.LiveDataMaxSize
-		if liveMax <= 0 {
-			liveMax = 1024 // LiveData 默认上限 1024 字节.
+		if s.LiveDataMaxSize < 0 {
+			panic("hgmRoomNotify: LiveDataMaxSize must not be negative, got " + strconv.Itoa(s.LiveDataMaxSize))
 		}
-		if liveMax > 16*1024*1024 { // LiveData 最大上限 16MB.
+		if s.LiveDataMaxSize == 0 {
+			s.LiveDataMaxSize = 1024 // 默认 1024 字节.
+		}
+		if s.LiveDataMaxSize > 16*1024*1024 { // 最大 16MB.
 			panic("hgmRoomNotify: LiveDataMaxSize too large, max 16MB, got " + strconv.Itoa(s.LiveDataMaxSize))
 		}
 		// LiveData 上限不能超过写缓冲的 25%(否则单条大 LiveData 容易撑满缓冲导致断连).
-		if liveMax > bufMax/4 {
-			panic("hgmRoomNotify: LiveDataMaxSize(" + strconv.Itoa(liveMax) + ") must be <= 25% of WriteBufMaxBytes(" + strconv.Itoa(bufMax) + ")")
+		if s.LiveDataMaxSize > s.WriteBufMaxBytes/4 {
+			panic("hgmRoomNotify: LiveDataMaxSize(" + strconv.Itoa(s.LiveDataMaxSize) + ") must be <= 25% of WriteBufMaxBytes(" + strconv.Itoa(s.WriteBufMaxBytes) + ")")
+		}
+		if s.RoomEnterMaxPerConn < 0 {
+			panic("hgmRoomNotify: RoomEnterMaxPerConn must not be negative, got " + strconv.Itoa(s.RoomEnterMaxPerConn))
+		}
+		if s.RoomEnterMaxPerConn == 0 {
+			s.RoomEnterMaxPerConn = 1024 // 默认 1024.
 		}
 		s.TimeoutCfg.LockCb(func(t *TimeoutCfg_t) {
 			t.InitWithDefault()
@@ -169,10 +181,6 @@ func (s *ServerManager) ServeHTTP(w http.ResponseWriter, r *http.Request){
 		http.Error(w, ctx3.ErrMsg, 400)
 		return
 	}
-	maxBufBytes:=s.WriteBufMaxBytes
-	if maxBufBytes<=0{
-		maxBufBytes = 64 * 1024 // 写缓冲默认 64KB.
-	}
 	useAuthQueue := s.OnAllowFn != nil
 	sconn :=&server_conn_t{
 		roomMap:         map[string]*room_t{},
@@ -187,19 +195,15 @@ func (s *ServerManager) ServeHTTP(w http.ResponseWriter, r *http.Request){
 		sconn:        sconn,
 	}
 	if useAuthQueue {
-		maxRooms := s.RoomEnterMaxPerConn
-		if maxRooms <= 0 {
-			maxRooms = 1024
-		}
-		sconn.cmdCh = make(chan Msg_t, maxRooms+2)
+		sconn.cmdCh = make(chan Msg_t, s.RoomEnterMaxPerConn+2)
 	}
 	// 写缓冲在每个发送批次前预留 websocket 帧头空间(GetFrameBufPrefixPreservedSize), 使 WriteFrame 原地写头零 copy.
 	sconn.writeBuf = server_conn_write_buf_t{
-		bipBuf: zlibChannel.NewFrame16BipBuf2(uint32(maxBufBytes), ctx3.Conn.GetFrameBufPrefixPreservedSize()),
+		bipBuf: zlibChannel.NewFrame16BipBuf2(uint32(s.WriteBufMaxBytes), ctx3.Conn.GetFrameBufPrefixPreservedSize()),
 		sconn:  sconn,
 	}
 	sconn.registerSessionKey(ctx2.SessionId)
-	ctx3.Conn.MaxReadMsgSize = uint32(maxBufBytes)
+	ctx3.Conn.MaxReadMsgSize = uint32(s.WriteBufMaxBytes)
 	sconn.conn.raw = &ctx3.Conn
 	// 未认证连接的超时关闭: 启用了认证(OnAllowFn!=nil)但连接还没认证通过(没收到 identity 或没批准).
 	if useAuthQueue {
@@ -375,14 +379,10 @@ func (s *ServerManager) FireChange(ev RoomEvent_t){
 	if len(ev.CVersionId) > 100 {
 		panic("hgmRoomNotify: CVersionId too long, max 100 bytes, got " + strconv.Itoa(len(ev.CVersionId)))
 	}
-	liveMax:=s.LiveDataMaxSize
-	if liveMax<=0{
-		liveMax = 1024 // LiveData 默认上限 1024 字节.
-	}
 	var liveBuf []byte
-	if len(ev.LiveData) > 0 && len(ev.LiveData) <= liveMax {
+	if len(ev.LiveData) > 0 && len(ev.LiveData) <= s.LiveDataMaxSize {
 		liveBuf = ev.LiveData
-	} else if len(ev.LiveData) > liveMax {
+	} else if len(ev.LiveData) > s.LiveDataMaxSize {
 		_emitObs(s.ObsFn, func(oev *ObsEvent_t) {
 			oev.Type = ObsEventType_serverLiveDataDropped
 			oev.RoomId = ev.RoomId
