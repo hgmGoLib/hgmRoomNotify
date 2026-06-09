@@ -30,9 +30,9 @@ func (wb *server_conn_write_buf_t) pushMsg(msg Msg_t) pushMsgResult_t {
 	if errMsg != "" {
 		return pushMsgResult_msgTooLarge
 	}
-	// 单条 frame 的硬上限是 BipBuf AllocFrame 的 uint16(65535). 超过 frame 上限的大 LiveData 由
+	// 单条 frame 的硬上限是单批 payload 上限减去子帧 2 字节长度头. 超过的大 LiveData 由
 	// pushMsgsAtomic 拆成 roomValueMore...roomValue 多条, 不会走到这里.
-	if msgSize > 65535 {
+	if msgSize > 65535 || (wb.bipBuf.MaxFramePayload > 0 && 2+uint32(msgSize) > wb.bipBuf.MaxFramePayload) {
 		return pushMsgResult_msgTooLarge
 	}
 	wb.mu.Lock()
@@ -63,7 +63,7 @@ func (wb *server_conn_write_buf_t) pushMsgsAtomic(msgs []Msg_t) pushMsgResult_t 
 	var total uint32
 	for i := range msgs {
 		msgSize, errMsg := msgs[i].BinarySize()
-		if errMsg != "" || msgSize > 65535 {
+		if errMsg != "" || msgSize > 65535 || (wb.bipBuf.MaxFramePayload > 0 && 2+uint32(msgSize) > wb.bipBuf.MaxFramePayload) {
 			return pushMsgResult_msgTooLarge
 		}
 		sizes[i] = msgSize

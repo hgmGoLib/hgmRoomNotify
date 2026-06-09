@@ -235,7 +235,6 @@ func (c *Client) tryConnOnceSync() (isContinue bool){
 		return true
 	}
 	c.logStatus(ClientStatus_connected)
-	ctx3.Conn.MaxReadMsgSize = uint32(c.ReadMsgMaxBytes)
 	thisConn:=&client_conn{
 		conn: conn_frame_t{raw: &ctx3.Conn},
 		c:    c,

@@ -6,7 +6,7 @@ package hgmRoomNotify
 func (sconn *server_conn_t) sendRoomValue(roomEpoch string, changeSeq uint64, roomId string, cVersionId string, liveData []byte){
 	// 单条 Cmd_roomValue 的序列化体积(不直接用 BinarySize, 因为它对 LiveData>65535 会直接报错, 而这里正是要据此判断是否分块).
 	singleSize := 1 + (2 + len(roomId)) + (1 + len(roomEpoch)) + getUvarintOutputSize(changeSeq) + (1 + len(cVersionId)) + (2 + len(liveData))
-	maxFrame := int(sconn.conn.raw.GetMaxFrameSize())
+	maxFrame := sconn.conn.maxSingleMsgSize()
 	if singleSize <= maxFrame {
 		sconn.sendMsgNoBlock(Msg_t{
 			Cmd:        Cmd_roomValue,

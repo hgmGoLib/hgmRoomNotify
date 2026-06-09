@@ -28,10 +28,10 @@ func TestWriteFrame_InPlace_RoundTrip(t *testing.T) {
 			defer cw.Close()
 			defer cr.Close()
 			wconn := &Conn_t{writer: cw, isWriteMask: tc.isMask}
-			rconn := &Conn_t{reader: cr, writer: cr, MaxReadMsgSize: 64 * 1024}
+			rconn := &Conn_t{reader: cr, writer: cr}
 
 			// 写端: 在 payload 前留出 prefix 字节, WriteFrame 应走原地写头(零 copy).
-			prefix := int(wconn.GetFrameBufPrefixPreservedSize())
+			prefix := int(wconn.GetFrameBufPreservedSize().Prefix)
 			buf := make([]byte, prefix+len(tc.payload))
 			copy(buf[prefix:], tc.payload)
 			fb := zlibVnet.FrameBuf{Buf: buf, StartPos: uint16(prefix)}
@@ -60,7 +60,7 @@ func TestWriteFrame_NoPrefix_Fallback(t *testing.T) {
 	defer cw.Close()
 	defer cr.Close()
 	wconn := &Conn_t{writer: cw, isWriteMask: false}
-	rconn := &Conn_t{reader: cr, writer: cr, MaxReadMsgSize: 64 * 1024}
+	rconn := &Conn_t{reader: cr, writer: cr}
 
 	payload := []byte("no-prefix-fallback-path")
 	var w zlibBytes.BufWriter

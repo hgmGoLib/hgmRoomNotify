@@ -10,27 +10,18 @@ import (
 // frame 内部字节由上层自行打包(本库上层用 [uint16LE len][msg]... 子帧), 本层不解释.
 var _ zlibVnet.Frame16Conn_i = (*Conn_t)(nil)
 
-// 给当前调用者的最大 frame 体积. 取 MaxReadMsgSize, 为 0(不限制)或超过 uint16 上限时返回 65535.
-func (conn *Conn_t) GetMaxFrameSize() uint16 {
-	if conn.MaxReadMsgSize == 0 || conn.MaxReadMsgSize > 65535 {
-		return 65535
-	}
-	return uint16(conn.MaxReadMsgSize)
-}
-
-// frameBuf 开头应该预留的空间 = websocket 帧头的最大长度.
-// 调用者(写缓冲)在 payload 前预留这么多字节, WriteFrame 就能把帧头原地右对齐写进预留区,
-// 单次 Write 发出 [帧头+payload] 而不必把 payload 再 copy 到一个带头部空间的 buffer.
-// 不掩码(服务端)最大帧头 10 字节(2 + 8 字节扩展长度); 掩码(客户端)再 +4 字节 mask key = 14.
-func (conn *Conn_t) GetFrameBufPrefixPreservedSize() uint16 {
+// 下层在 payload 前后需要追加的空白字节数.
+// Prefix = websocket 帧头最大长度: 因为最终写入硬限 Frame16MaxWriteSize(16KB) < 65536,
+// payload 永远用不到 8 字节扩展长度, 帧头最多 2 + 2(16 位扩展长度) = 4 字节; 掩码(客户端)再 +4 = 8.
+// 调用者在 payload 前预留这么多字节, WriteFrame 就能把帧头原地右对齐写进预留区,
+// 单次 Write 发出 [帧头+payload] 而不必把 payload 再 copy 到带头部空间的 buffer.
+// Suffix = 0: websocket 自带分帧, 不需要调用者预留 footer 空间.
+func (conn *Conn_t) GetFrameBufPreservedSize() zlibVnet.FrameBufPreservedSize_t {
 	if conn.isWriteMask {
-		return 14
+		return zlibVnet.FrameBufPreservedSize_t{Prefix: 8, Suffix: 0}
 	}
-	return 10
+	return zlibVnet.FrameBufPreservedSize_t{Prefix: 4, Suffix: 0}
 }
-
-// websocket 自带分帧, 不需要调用者预留 footer 空间.
-func (conn *Conn_t) GetFrameBufSuffixPreservedSize() uint16 { return 0 }
 
 // 把 fb.Buf[fb.StartPos:] 作为一个 websocket 二进制消息发送. 借用语意: 返回后不持有 fb.
 // 若 fb.StartPos 处前面留有足够的帧头空间(>= 实际帧头长度), 则原地写帧头、单次发送, 零 payload copy;
@@ -109,9 +100,10 @@ func (conn *Conn_t) writeFrameInPlace(buf []byte, startPos, dataLen, hdrLen int)
 }
 
 // 读取一个 websocket 消息填入 fb. 成功后 fb.Buf[fb.StartPos:] 为 payload (StartPos=0).
+// 读帧上限固定 Frame16MaxWriteSize(下层不能控制), 超限拒收.
 func (conn *Conn_t) ReadFrame(fb *zlibVnet.FrameBuf) error {
 	conn.readCache.Reset()
-	errMsg := conn.ReadMsg(&conn.readCache, conn.MaxReadMsgSize)
+	errMsg := conn.ReadMsg(&conn.readCache, zlibVnet.Frame16MaxWriteSize)
 	if errMsg != "" {
 		return errors.New(errMsg)
 	}

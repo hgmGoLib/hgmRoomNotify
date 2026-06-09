@@ -8,6 +8,7 @@ import (
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibSync"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibTimer"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibChannel"
+	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibVnet"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibWebsocket2"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibIdGen"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibCloser"
@@ -197,13 +198,14 @@ func (s *ServerManager) ServeHTTP(w http.ResponseWriter, r *http.Request){
 	if useAuthQueue {
 		sconn.cmdCh = make(chan Msg_t, s.RoomEnterMaxPerConn+2)
 	}
-	// 写缓冲在每个发送批次前预留 websocket 帧头空间(GetFrameBufPrefixPreservedSize), 使 WriteFrame 原地写头零 copy.
+	// 写缓冲在每个发送批次前后预留下层帧头/帧尾空间(GetFrameBufPreservedSize), 使 WriteFrame 原地写头/尾零 copy;
+	// 并按下层最终写入硬限(Frame16MaxWriteSize)减去前后预留, 封顶单批 payload.
+	ps := ctx3.Conn.GetFrameBufPreservedSize()
 	sconn.writeBuf = server_conn_write_buf_t{
-		bipBuf: zlibChannel.NewFrame16BipBuf2(uint32(s.WriteBufMaxBytes), ctx3.Conn.GetFrameBufPrefixPreservedSize()),
+		bipBuf: zlibChannel.NewFrame16BipBuf2(uint32(s.WriteBufMaxBytes), ps.Prefix, ps.Suffix, zlibVnet.Frame16MaxWriteSize-uint32(ps.Prefix)-uint32(ps.Suffix)),
 		sconn:  sconn,
 	}
 	sconn.registerSessionKey(ctx2.SessionId)
-	ctx3.Conn.MaxReadMsgSize = uint32(s.WriteBufMaxBytes)
 	sconn.conn.raw = &ctx3.Conn
 	// 未认证连接的超时关闭: 启用了认证(OnAllowFn!=nil)但连接还没认证通过(没收到 identity 或没批准).
 	if useAuthQueue {

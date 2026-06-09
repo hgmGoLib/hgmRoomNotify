@@ -515,6 +515,13 @@ func (c *conn_frame_t) readThread(){
 		}
 	}
 }
+// 单条消息序列化体积上限 = 下层单批 payload 上限(最终写入硬限减去下层前后预留)再减去子帧 2 字节长度头.
+// 连接建立后固定.
+func (c *conn_frame_t) maxSingleMsgSize() int {
+	ps := c.raw.GetFrameBufPreservedSize()
+	return int(zlibVnet.Frame16MaxWriteSize) - int(ps.Prefix) - int(ps.Suffix) - 2
+}
+
 // 序列化并发送单条消息, 带uint16长度前缀. 客户端使用.
 // 注意: uint16(msgSize) 不会溢出, 因为客户端只发送 ping(1字节)/roomEnter/roomLeave(最大1027字节),
 // 远小于 uint16 最大值 65535.
@@ -525,7 +532,7 @@ func (c *conn_frame_t) writeMsg(msg Msg_t) {
 		c.closer.Close2()
 		return
 	}
-	prefix:=int(c.raw.GetFrameBufPrefixPreservedSize())
+	prefix:=int(c.raw.GetFrameBufPreservedSize().Prefix)
 	c.writeLock.Lock()
 	c.writeBufW.Reset()
 	// 前面留出 prefix 字节给 websocket 帧头(WriteFrame 原地写头, 零 copy), 子帧 [uint16 len][msg] 从 prefix 处开始.

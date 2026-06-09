@@ -53,7 +53,7 @@ func parseFrames(t *testing.T, payload []byte) [][]byte {
 }
 
 func TestFrame16BipBuf2_Basic_WithPrefix(t *testing.T) {
-	bb := NewFrame16BipBuf2(1024, 4)
+	bb := NewFrame16BipBuf2(1024, 4, 0, 0)
 	buf := bb.AllocFrame(5)
 	if buf == nil {
 		t.Fatal("AllocFrame failed")
@@ -80,7 +80,7 @@ func TestFrame16BipBuf2_Basic_WithPrefix(t *testing.T) {
 }
 
 func TestFrame16BipBuf2_PrefixZero_SameAsOriginal(t *testing.T) {
-	bb := NewFrame16BipBuf2(1024, 0)
+	bb := NewFrame16BipBuf2(1024, 0, 0, 0)
 	buf := bb.AllocFrame(5)
 	copy(buf, []byte("world"))
 	send := bb.TakeSendSlice()
@@ -97,7 +97,7 @@ func TestFrame16BipBuf2_PrefixZero_SameAsOriginal(t *testing.T) {
 func TestFrame16BipBuf2_Model_GrowWrapIntegrity(t *testing.T) {
 	for _, prefix := range []uint16{0, 1, 4, 10, 14} {
 		for _, maxCap := range []uint32{128, 256, 1024, 4096} {
-			bb := NewFrame16BipBuf2(maxCap, prefix)
+			bb := NewFrame16BipBuf2(maxCap, prefix, 0, 0)
 			pending := [][]byte{} // 已写入但还没被 take 返回的 frame, FIFO
 			seq := byte(0)
 			// LCG 确定性伪随机.
@@ -164,7 +164,7 @@ func TestFrame16BipBuf2_Model_GrowWrapIntegrity(t *testing.T) {
 
 // 显式回绕: 构造 wrap 状态, 确认回绕后的批次也带 prefix scratch 且数据正确.
 func TestFrame16BipBuf2_WrapHasPrefix(t *testing.T) {
-	bb := NewFrame16BipBuf2(128, 4)
+	bb := NewFrame16BipBuf2(128, 4, 0, 0)
 	// 写满->发送->确认, 把游标推到中间, 再制造尾部不足触发回绕.
 	a := bb.AllocFrame(40)
 	copy(a, bytes.Repeat([]byte("A"), 40))
@@ -197,4 +197,115 @@ func TestFrame16BipBuf2_WrapHasPrefix(t *testing.T) {
 		}
 	}
 	// C 可能已在前一次 TakeSendSlice 取走; 只要全程没 panic 且 prefix room 充足即视为通过.
+}
+
+// 取走一批, 同时写脏 prefix scratch(前)与 suffix scratch(cap-len, 后), 校验都不破坏 payload,
+// 并断言 payload 不超过 maxFramePayload. 返回 payload(去掉 prefix).
+func takeDirtyBoth(t *testing.T, bb *Frame16BipBuf2, maxFramePayload uint32) []byte {
+	t.Helper()
+	send := bb.TakeSendSlice()
+	if send == nil {
+		return nil
+	}
+	prefix := int(bb.Prefix)
+	if len(send) < prefix {
+		t.Fatalf("send slice shorter than prefix: len=%d prefix=%d", len(send), prefix)
+	}
+	payloadLen := len(send) - prefix
+	if maxFramePayload > 0 && uint32(payloadLen) > maxFramePayload {
+		t.Fatalf("payload %d exceeds maxFramePayload %d", payloadLen, maxFramePayload)
+	}
+	payload := make([]byte, payloadLen)
+	copy(payload, send[prefix:])
+	// 写脏 prefix scratch.
+	for i := 0; i < prefix; i++ {
+		send[i] = 0xAA
+	}
+	// 写脏 suffix scratch: 返回切片 cap 超出 len 的部分即下层可原地写 tag 的空白.
+	full := send[:cap(send)]
+	for i := len(send); i < cap(send); i++ {
+		full[i] = 0xBB
+	}
+	// 两段 scratch 写脏后, payload 不应被破坏.
+	if !bytes.Equal(payload, send[prefix:]) {
+		t.Fatal("writing prefix/suffix scratch corrupted current payload")
+	}
+	return payload
+}
+
+// 模型法压力测试(带 Suffix 后置留空 + MaxFramePayload 封顶): 随机交替 写帧/取批, 每次取批都写脏
+// prefix 与 suffix scratch, FIFO 队列校验数据顺序与完整性. suffix scratch 若越界写进未发送数据
+// (gap 逻辑出错)会在后续 take 的 FIFO 比对中暴露; payload 超过封顶也会被断言抓住.
+func TestFrame16BipBuf2_Model_SuffixAndMaxFrame(t *testing.T) {
+	for _, prefix := range []uint16{0, 2, 4, 8} {
+		for _, suffix := range []uint16{0, 1, 16} {
+			for _, maxFramePayload := range []uint32{40, 64, 200} {
+				for _, maxCap := range []uint32{128, 256, 1024} {
+					bb := NewFrame16BipBuf2(maxCap, prefix, suffix, maxFramePayload)
+					pending := [][]byte{}
+					seq := byte(0)
+					rng := uint32(0x9e3779b9 + maxCap + uint32(prefix)*7 + uint32(suffix)*13 + maxFramePayload*3)
+					next := func() uint32 { rng = rng*1664525 + 1013904223; return rng }
+					// 单子帧 2+n 不得超过 maxFramePayload.
+					maxN := maxFramePayload - 2
+					if maxN > 120 {
+						maxN = 120
+					}
+
+					for iter := 0; iter < 6000; iter++ {
+						if next()%2 == 0 {
+							n := uint16(1 + next()%maxN)
+							buf := bb.AllocFrame(n)
+							if buf == nil {
+								continue
+							}
+							seq++
+							for i := range buf {
+								buf[i] = seq
+							}
+							f := make([]byte, n)
+							for i := range f {
+								f[i] = seq
+							}
+							pending = append(pending, f)
+						} else {
+							payload := takeDirtyBoth(t, &bb, maxFramePayload)
+							if payload == nil {
+								if len(pending) != 0 {
+									t.Fatalf("p=%d s=%d mf=%d cap=%d: nil but %d pending", prefix, suffix, maxFramePayload, maxCap, len(pending))
+								}
+								continue
+							}
+							frames := parseFrames(t, payload)
+							if len(frames) > len(pending) {
+								t.Fatalf("p=%d s=%d mf=%d cap=%d: got %d frames but %d pending", prefix, suffix, maxFramePayload, maxCap, len(frames), len(pending))
+							}
+							for i, f := range frames {
+								if !bytes.Equal(f, pending[i]) {
+									t.Fatalf("p=%d s=%d mf=%d cap=%d iter=%d: frame %d mismatch (corruption)", prefix, suffix, maxFramePayload, maxCap, iter, i)
+								}
+							}
+							pending = pending[len(frames):]
+						}
+					}
+					for {
+						payload := takeDirtyBoth(t, &bb, maxFramePayload)
+						if payload == nil {
+							break
+						}
+						frames := parseFrames(t, payload)
+						for i, f := range frames {
+							if !bytes.Equal(f, pending[i]) {
+								t.Fatalf("drain p=%d s=%d mf=%d cap=%d: frame %d mismatch", prefix, suffix, maxFramePayload, maxCap, i)
+							}
+						}
+						pending = pending[len(frames):]
+					}
+					if len(pending) != 0 {
+						t.Fatalf("p=%d s=%d mf=%d cap=%d: %d frames never drained", prefix, suffix, maxFramePayload, maxCap, len(pending))
+					}
+				}
+			}
+		}
+	}
 }

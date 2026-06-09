@@ -16,8 +16,6 @@ type Conn_t struct {
 	closer      io.Closer
 	writeCache  zlibBytes.BufWriter
 	isWriteMask bool
-	// 单条消息最大读取字节数. 0表示不限制. 调用者构造后设置, 供 ReadFrame/GetMaxFrameSize 使用.
-	MaxReadMsgSize uint32
 	// ReadFrame 复用的读缓冲.
 	readCache zlibBytes.BufWriter
 }

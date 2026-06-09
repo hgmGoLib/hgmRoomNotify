@@ -1,15 +1,24 @@
 package zlibVnet
 
+// 底层最终组装写入(含下层自己追加的 prefix/suffix)的硬上限, 单位字节.
+// 下层不能控制/放大这个值; 上层可用 payload = Frame16MaxWriteSize - Prefix - Suffix.
+// 发送方需要更小帧时可在 <= 此值内自行设更小的发送上限(连接建立后固定), 接收方固定按此值拒收超限帧.
+// 选 16KB 与 TLS record(2^14)/HTTP2 默认帧对齐: 同连接缓冲有界, 加密层可整 record 处理.
+const Frame16MaxWriteSize = 16 * 1024
+
+// 下层在 payload 前后各自需要追加的字节数(同一底层实现对象该值固定不变).
+// 上层据此给 buffer 故意留出前后空白, 让下层原地写帧头/帧尾, 实现 0 alloc / 0 copy.
+type FrameBufPreservedSize_t struct {
+	Prefix uint16
+	Suffix uint16
+}
+
 // 分层帧连接接口.
 // frame16 指的是序列化为 [len uint16][data []byte] [len uint16][data []byte] 这种模式.
-// 建议最下层最大 payload 限制为 16*1024 (如果需要更大,应该用 hasMore 模式单线程流式处理)
-// 上层随着当前的包裹,而越来越小.(类似 ip 包的 mtu 设计)
+// 底层最终写入(含 prefix/suffix)硬限 Frame16MaxWriteSize; 上层可用 payload 随包裹越来越小(类似 IP MTU).
 type Frame16Conn_i interface {
-	GetMaxFrameSize() uint16 // 给当前调用者的最大 frame 体积.
-	// frameBuf 开头应该预留的空间. 同一个底层实现对象,该值应该一样.
-	GetFrameBufPrefixPreservedSize() uint16
-	// frameBuf 结束应该预留的空间. 同一个底层实现对象,该值应该一样.
-	GetFrameBufSuffixPreservedSize() uint16
+	// 下层在 payload 前后需要追加的空白字节数. 上层据此预留空间以便下层原地写头/尾.
+	GetFrameBufPreservedSize() FrameBufPreservedSize_t
 	// 借用语意: fb 仅在本次调用内借给实现, 实现可读取/原地修改, 但返回后所有权归还调用者,
 	// 不得继续持有 fb 引用 (要留数据自行 copy). 调用者可在返回后立即复用同一个 fb 写下一帧.
 	WriteFrame(fb *FrameBuf) error
