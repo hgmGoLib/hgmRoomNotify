@@ -1,10 +1,10 @@
 package zlibVnet
 
-// 底层最终组装写入(含下层自己追加的 prefix/suffix)的硬上限, 单位字节.
-// 下层不能控制/放大这个值; 上层可用 payload = Frame16MaxWriteSize - Prefix - Suffix.
+// 最底层把一帧序列化完成后真正写到 socket 的那整段字节(含下层自己追加的 prefix/suffix 帧头/帧尾)的硬上限, 单位字节.
+// 含义: frameBuf 里最终交给 socket 的 buf 整段长度 <= Frame16MaxWriteSize(= 64KB). 这是协议隐式恒定值,
+// 下层不能控制/放大它; 上层可用 payload = Frame16MaxWriteSize - Prefix - Suffix.
 // 发送方需要更小帧时可在 <= 此值内自行设更小的发送上限(连接建立后固定), 接收方固定按此值拒收超限帧.
-// 选 16KB 与 TLS record(2^14)/HTTP2 默认帧对齐: 同连接缓冲有界, 加密层可整 record 处理.
-const Frame16MaxWriteSize = 16 * 1024
+const Frame16MaxWriteSize = 64 * 1024
 
 // 下层在 payload 前后各自需要追加的字节数(同一底层实现对象该值固定不变).
 // 上层据此给 buffer 故意留出前后空白, 让下层原地写帧头/帧尾, 实现 0 alloc / 0 copy.

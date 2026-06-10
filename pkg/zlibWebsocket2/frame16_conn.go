@@ -11,7 +11,7 @@ import (
 var _ zlibVnet.Frame16Conn_i = (*Conn_t)(nil)
 
 // 下层在 payload 前后需要追加的空白字节数.
-// Prefix = websocket 帧头最大长度: 因为最终写入硬限 Frame16MaxWriteSize(16KB) < 65536,
+// Prefix = websocket 帧头最大长度: 最终写入硬限 Frame16MaxWriteSize = 64KB(含帧头), 故 payload 必然 < 65536,
 // payload 永远用不到 8 字节扩展长度, 帧头最多 2 + 2(16 位扩展长度) = 4 字节; 掩码(客户端)再 +4 = 8.
 // 调用者在 payload 前预留这么多字节, WriteFrame 就能把帧头原地右对齐写进预留区,
 // 单次 Write 发出 [帧头+payload] 而不必把 payload 再 copy 到带头部空间的 buffer.

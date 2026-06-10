@@ -110,7 +110,7 @@
    leaveFn()
    ```
 
-完整可运行的 Go 端 demo(服务端 + 客户端在一个进程里跑起来)见 [`example/`](example/), 运行 `go run ./example`。
+完整可运行的 Go 端 demo(服务端 + 客户端在一个进程里跑起来)见 [`example/SimpleDemo/`](example/SimpleDemo/), 运行 `cd example && go run ./SimpleDemo`(全部例子见下方[例子](#例子)一节)。
 
 ## 调试/状态查询
 
@@ -273,8 +273,20 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 4. "是不是断过线"不需要单独判断: 任何中断都会表现为"`LiveData` 缺失"或"序号跳号", 被上面的 ajax 路径统一兜住。
    这条 ajax 路径同时就是"离线消息/历史/回放/断线补发"的实现——新客户端进房、断线重连、服务器重启后, 都靠它把缺的消息补回来。
 
-运行例子: `go run ./example/ReliableChat`; 跑自动测试: `go test ./example/ReliableChat/`。
+运行例子: `cd example && go run ./ReliableChat`; 跑自动测试: `cd example && go test ./ReliableChat`。
 自动测试覆盖: 逐条快路径送达、突发连发不丢消息、超大 `LiveData` 降级 ajax、进房回放历史、ws 重启后断线补发。
+
+## 例子
+
+所有例子在 [`example/`](example/) 目录下, 是一个**独立的 go module**(自己的 `go.mod`),
+这样浏览器真机测试用到的 chromedp 等测试依赖不会泄漏进本库(`hgmRoomNotify`)的 `go.mod`。
+运行前先 `cd hgmRoomNotify/example`。
+
+| 例子 | 说明 | 运行 / 测试 |
+| --- | --- | --- |
+| [`SimpleDemo/`](example/SimpleDemo/) | 最小闭环: 同进程起服务端 + Go 客户端, `FireChange` 通知。 | `go run ./SimpleDemo` / `go test ./SimpleDemo` |
+| [`ReliableChat/`](example/ReliableChat/) | ws 戳一下 + ajax 兜底实现可靠聊天: 可靠送达 / 离线消息 / 历史回放 / 断线补发(纯 Go)。 | `go run ./ReliableChat` / `go test ./ReliableChat` |
+| [`WebChat/`](example/WebChat/) | 浏览器 **React** 前端 + Go 后端(内存库)的可靠聊天室, 复用 ReliableChat 的可靠模式; 浏览器客户端编译前复制进前端(gitignore, 仓库不留第二份)。含真 Chrome 真机自动测试。 | 见 [`WebChat/README.md`](example/WebChat/) (先 `npm install && npm run build`) / `go test ./WebChat` |
 
 ## License
 
