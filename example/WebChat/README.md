@@ -56,8 +56,8 @@ cd hgmRoomNotify/example
 go test ./WebChat          # 无需先 npm build，测试内部会自动打包
 ```
 
-测试（`webchat_test.go`）沿用 `hgmRoomNotifyTest/hgmRoomNotifyBrowserTest` 的模式，
-并和一键入口复用同一套定位+编译逻辑（`repo_build.go` 的 `FindHgmRoomNotifyRoot` / `BuildFrontend`）：
-定位项目根 → `npm run build`（自动复制客户端 + esbuild 打包）→ 起真后端 → 用真 Chrome（`hgmChromeDp`）加载页面，
+测试（`webchat_test.go`）和一键入口复用同一套定位+编译逻辑（`repo_build.go` 的 `FindHgmRoomNotifyRoot` / `BuildFrontend`）：
+定位项目根 → `npm run build`（自动复制客户端 + esbuild 打包）→ 起真后端 → 用真 Chrome（`zlib_test.go` 里基于
+`github.com/chromedp/chromedp` 的简化封装，不依赖私有库）加载页面，
 验证正常路径：浏览器连上进房间、收到服务端推的消息、在页面里真实输入并点发送、渲染结果与后端内存库一致。
 （首次运行若 `web/node_modules` 不存在会自动 `npm install`。异常路径本次不测。）

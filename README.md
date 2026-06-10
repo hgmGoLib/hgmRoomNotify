@@ -1,28 +1,31 @@
 # hgmRoomNotify
 
-基于 WebSocket 的房间状态变更通知框架。
+基于 WebSocket 的房间状态变更通知框架。服务端维护若干"房间", 数据变更时通知所有订阅了该房间的客户端;
+客户端收到通知后自行通过 ajax 拉取最新数据。框架只负责"戳一下", 不负责传输完整业务数据。
 
-## 能干什么
+## 功能概览
 
 1. 服务端维护若干"房间"(Room), 每个房间有一个字符串 id。
 2. 客户端通过 WebSocket 连接后, 可以加入/离开房间。
 3. 服务端调用 `FireChange(roomId)` 时, 所有订阅了该房间的客户端会收到变更通知。
-4. 变更通知携带三个信息:
+4. 变更通知携带以下信息:
    - `GProcessId`+`ChangeSeq`: 框架自动维护。`GProcessId` 是服务端进程 id, `ChangeSeq` 每次 `FireChange` 递增, 客户端用来判断是否有新变化和检测服务器重启。
-   - `CVersionId`: 调用者自定义的版本 id, 最大 100 字节。服务端内存存储。可选。服务器重启会丢失。
-   - `LiveData`: 本次变更的附加数据, 最大 1024 字节。服务端不存储, 仅实时传递。可选。网络断线重连或者服务器重启会丢失。
-   - 选哪个: **当前状态量**("是什么", 如在线/typing、未读数、数据版本号)用 `CVersionId`(存当前值, 进房/重连自动下发, 丢一次会自动收敛, 必要时 ajax 保底);
-     **一次性增量**("发生了什么", 如新消息、streaming 片段)用 `LiveData`(尽力而为, 丢了走 ajax 补)。详见 [`example/ReliableChat/`](example/ReliableChat/)。
+   - `CVersionId`: 调用者自定义的版本 id, 最大 100 字节。服务端内存存储, 可选, 服务器重启会丢失。
+   - `LiveData`: 本次变更的附加数据, 默认最大 1024 字节(可调)。服务端不存储, 仅实时传递, 可选; 网络断线重连或服务器重启会丢失。
+   - 两者如何选: **当前状态量**("是什么", 如在线/typing、未读数、数据版本号)用 `CVersionId`(存当前值, 进房/重连自动下发, 丢一次会自动收敛, 必要时 ajax 保底);
+     **一次性增量**("发生了什么", 如新消息、streaming 片段)用 `LiveData`(尽力而为, 丢了走 ajax 补)。详见下文[工作模式](#工作模式-通知--拉取)。
 5. 客户端断线后自动重连, 重连后自动重新加入所有之前的房间, 并收到当前版本号。
-6. 支持认证(可选): 服务端配置 `OnAllowFn` 回调, 同时处理连接级和房间级准入(`ctx.RoomId==""` 为连接级)。
-   不配置则全部放行(和没有认证一样)。客户端发送 in-band identity(类似 sessionId/token, 本模块不解析),
+6. 认证(可选): 服务端配置 `OnAllowFn` 回调, 同时处理连接级和房间级准入(`ctx.RoomId==""` 为连接级)。
+   不配置则全部放行(等同于无认证)。客户端发送 in-band identity(类似 sessionId/token, 本模块不解析),
    也可由网络层(ws cookie/url query)经 `OnAcceptFn` 提供网络层 sessionId。两个身份来源互相独立。
-7. 支持运行时撤权/踢下线: 服务端 `conn.CloseConn(isTemp,reason)` 或 `CloseConnBySessionId(sessionId,isTemp,reason)`。
-   `isTemp=true` 客户端重连(重连重新过 `OnAllowFn`, 用于撤权); `isTemp=false` 客户端不再重连(永久封禁/下线)。
+7. 运行时撤权/踢下线: 服务端调用 `conn.CloseConn(isTemp, reason)` 或 `CloseConnBySessionId(sessionId, isTemp, reason)`。
+   `isTemp=true` 客户端会重连(重连重新过 `OnAllowFn`, 用于撤权); `isTemp=false` 客户端不再重连(永久封禁/下线)。
 8. 客户端配置 `OnDenyFn` 处理被拒(连接级/房间级)。不配置时遇到 deny 视为对接错误(断开且不再重连, 应修复 bug)。
-9. 有 Go 客户端和浏览器 TypeScript 客户端两套实现。
+9. 提供 Go 客户端和浏览器 TypeScript 客户端两套实现。
 
-## 怎么干 (服务端 Go)
+## 快速开始
+
+### 服务端 (Go)
 
 1. 创建 `ServerManager` 实例, 配置超时参数和认证回调:
 
@@ -34,7 +37,7 @@
    }
    ```
 
-2. 将 `ServerManager` 注册为 `http.Handler` (它实现了 `ServeHTTP`):
+2. 将 `ServerManager` 注册为 `http.Handler`(它实现了 `ServeHTTP`):
 
    ```go
    mux := http.NewServeMux()
@@ -43,34 +46,34 @@
    defer httpServer.Close()
    ```
 
-   或者在已有框架中对接, 拿到 `http.ResponseWriter` 和 `*http.Request` 后调用 `wsServer.ServeHTTP(w, r)`。
+   也可在已有框架中对接: 拿到 `http.ResponseWriter` 和 `*http.Request` 后调用 `wsServer.ServeHTTP(w, r)`。
 
-3. 业务代码中, 数据变更时调用 `FireChange`:
+3. 数据变更时调用 `FireChange`:
 
    ```go
    wsServer.FireChange(hgmRoomNotify.RoomEvent_t{
        RoomId:     "order:12345",
        CVersionId: "v3",                          // 可选
-       LiveData:   []byte(`{"Status":"paid"}`),   // 可选, 最大 1024 字节
+       LiveData:   []byte(`{"Status":"paid"}`),   // 可选, 默认最大 1024 字节
    })
    ```
 
    所有订阅了 `"order:12345"` 这个房间的客户端都会收到通知。
 
-## 怎么干 (浏览器 TypeScript 客户端)
+### 浏览器客户端 (TypeScript)
 
 1. 创建客户端实例并设置 URL:
 
    ```ts
-   import { WssChangeStatus3_t } from "./hgmWs3_ChangeStatus"
-   const ws = new WssChangeStatus3_t()
-   ws.setUrl("/ws")  // 会自动根据当前页面协议转为 wss:// 或 ws://
+   import { hgmRn_Client } from "./hgmRoomNotifyBrowserTs/index.ts"
+   const client = new hgmRn_Client()
+   client.setUrl("/ws")  // 会自动根据当前页面协议转为 wss:// 或 ws://
    ```
 
 2. 加入房间并监听变更:
 
    ```ts
-   const leaveFn = ws.roomEnter("order:12345", (ev) => {
+   const leaveFn = client.roomEnter("order:12345", (ev) => {
        // ev.RoomId      房间 id
        // ev.GProcessId  服务端进程 id(用于检测服务器重启, 通常不需要关心)
        // ev.ChangeSeq   变化序号(用于去重, 通常不需要关心)
@@ -87,7 +90,7 @@
    leaveFn()  // 取消订阅。所有房间都离开后连接会在 20 秒后自动关闭。
    ```
 
-## 怎么干 (Go 客户端)
+### Go 客户端
 
 1. 创建客户端实例:
 
@@ -110,9 +113,85 @@
    leaveFn()
    ```
 
-完整可运行的 Go 端 demo(服务端 + 客户端在一个进程里跑起来)见 [`example/SimpleDemo/`](example/SimpleDemo/), 运行 `cd example && go run ./SimpleDemo`(全部例子见下方[例子](#例子)一节)。
+完整可运行的 Go 端 demo(服务端 + 客户端在一个进程里跑起来)见 [`example/SimpleDemo/`](example/SimpleDemo/),
+运行 `cd example && go run ./SimpleDemo`。全部例子见[示例](#示例)。
 
-## 调试/状态查询
+## 工作模式: 通知 + 拉取
+
+本框架的设计意图是作为"变更通知层", 配合 ajax 获取实际数据:
+
+1. 服务端数据变更时 → `FireChange(roomId)`, 可选带少量 `LiveData`。
+2. 客户端收到 onChange → 发 ajax 请求获取最新完整数据。
+3. 断线重连 → 重新加入房间 → 发现版本号变了 → ajax 取最新数据。
+
+这种模式的好处:
+
+- 事件只存内存, 不需要数据库持久化事件, 没有事件存储/清理的复杂逻辑。
+- 实际业务数据的持久化由已有的数据库负责, ws 层不重复存储。
+- 性能容易优化: `FireChange` 只是内存操作 + 写 ws 缓冲, 不涉及 IO。
+- 慢客户端不影响其他客户端: 写缓冲满了就断开那一个连接, 不阻塞广播。
+- 不会爆内存: 每个连接独立的固定大小写缓冲(默认 64KB), `LiveData` 不存储。
+
+对于 streaming 场景(如 AI streaming 输出)的经验:
+
+- `LiveData` 1024 字节放一次 200ms 间隔内的增量文本, 大多数情况够用(200ms 内 AI 产生的文本通常几十到几百字节)。
+- 偶尔一次增量超了 1024 字节, `LiveData` 会被丢弃, 但通知仍然发出, 前端发现 `LiveData` 为 null 时走 ajax 补取。
+- 断线重连本身就要 ajax 重新取完整状态, 所以这个降级路径本来就得有。
+- 不要试图通过 ws 推送完整的大块数据(如完整 streaming 内容), 否则会有阻塞/爆内存风险。
+  让 ws 只负责通知, 大数据走 ajax, 两条路径各司其职。
+
+为什么是"戳一下 + 拉取"而不是"直接用 ws 推内容当可靠", 以及为什么在本库约束下这已是已知最优结构(剩下只能调参数),
+见 [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md)。
+
+### 适用场景
+
+前提是 **ws 通知 + ajax(或 http rpc)取数** 两条路径配合: ws 只负责"戳一下"告诉客户端某个 room 变了,
+真实数据和可靠性由业务自己的数据库 + ajax 负责。在这个前提下:
+
+| 场景 | 是否适合 |
+| --- | --- |
+| 新消息提醒(告诉客户端"这个会话变了") | 适合 |
+| 客户端收到通知后拉取最新消息列表 | 适合 |
+| 未读数、会话列表刷新通知 | 适合 |
+| typing / 在线状态这类当前状态量 | 适合(用 `CVersionId` 存当前状态, 进房/重连自动下发, 必要时 ajax 保底) |
+| 每条聊天消息可靠送达 | 适合(ws 通知 + ajax 兜底, 见 [`example/ReliableChat/`](example/ReliableChat/); 纯靠 ws `LiveData` 当可靠送达不适合) |
+| 离线消息、消息历史、回放、断线补发 | 适合(历史存数据库 + ajax 拉取, ws 只负责戳一下, 见 [`example/ReliableChat/`](example/ReliableChat/)) |
+| 大规模多节点分布式通知 | 需要额外改造(本库是单进程房间表)。看起来有办法解决、且全广播档不用改库, 理论分析见 [`doc/multiNodeDistribute.md`](doc/multiNodeDistribute.md)(**仅理论, 未实践**) |
+
+### CVersionId 还是 LiveData
+
+`FireChange` 可选携带 `CVersionId` 和 `LiveData`, 两者语义不同, 对接时容易选错:
+
+| | 服务端存储 | 进房/重连 | 适合什么 |
+| --- | --- | --- | --- |
+| `CVersionId`(≤100 字节) | 存内存当前值 | 进房/重连自动下发当前值 | **当前状态量**("是什么"): 在线/typing、未读数、数据版本号 |
+| `LiveData`(默认 ≤1024 字节) | 不存, 仅实时传一次 | 重连/缓冲满/超限就没了 | **一次性增量**("发生了什么"): 新消息、streaming 文本片段 |
+
+- **状态量用 `CVersionId`**。它是"当前完整状态", 丢一次通知没关系——下一次通知或进房/重连会带上最新值, **自动收敛到正确状态**。
+  例如 typing / 在线状态: `FireChange(RoomId, CVersionId="在线状态编码")`, 客户端 `onChange` 直接读 `ev.CVersionId` 更新 UI, **不需要 ajax**;
+  只在服务器重启(`CVersionId` 丢失、`RoomEpoch` 变化)时用 ajax 取一次当前完整状态保底。100 字节放状态编码或版本号通常够用, 不够就用 `CVersionId` 当版本号 + ajax 取完整列表。
+- **一次性增量用 `LiveData`**。丢了(缓冲满/断线/超上限)就走 ajax 补。聊天消息属于这类(每条是新增内容, 不是"当前状态"), 见 [`example/ReliableChat/`](example/ReliableChat/)。
+
+### 可靠送达 / 历史 / 断线补发
+
+本框架可以做到"聊天消息可靠送达"和"离线消息/消息历史/回放/断线补发":把 ws 当"戳一下"的低延迟通道,
+把 ajax(或 http rpc)当真实数据来源, 两者配合即可。对接代码很简单, 代价仅仅是某些情况(`LiveData` 不够用时)多一个 RTT。
+
+核心思路(完整可运行代码 + 自动测试见 [`example/ReliableChat/`](example/ReliableChat/)):
+
+1. 真正的可靠性锚点是**业务消息序号**(每个房间内单调递增, 存数据库), 不是 ws 层的 `ChangeSeq`
+   (`ChangeSeq` 只是"戳一下"信号, 服务器重启会重置)。
+2. 服务端每来一条消息: 先写库分配序号, 再 `FireChange`, 把整条消息塞进 `LiveData`(尽力而为)。
+3. 客户端收到 onChange:
+   - `LiveData` 有内容, 且序号正好接在本地最后一条之后 → 直接用 `LiveData` 应用, **0 额外 RTT**(快路径, 即"直接推送每一条聊天消息")。
+   - 否则(`LiveData` 没有/被丢弃/超上限/重连/服务器重启, 或者序号跳号说明中间漏了)→ **ajax 拉取本地最后序号之后的全部消息**补齐。
+4. "是不是断过线"不需要单独判断: 任何中断都会表现为"`LiveData` 缺失"或"序号跳号", 被上面的 ajax 路径统一兜住。
+   这条 ajax 路径同时就是"离线消息/历史/回放/断线补发"的实现——新客户端进房、断线重连、服务器重启后, 都靠它把缺的消息补回来。
+
+运行例子: `cd example && go run ./ReliableChat`; 跑自动测试: `cd example && go test ./ReliableChat`。
+自动测试覆盖: 逐条快路径送达、突发连发不丢消息、超大 `LiveData` 降级 ajax、进房回放历史、ws 重启后断线补发。
+
+## 客户端状态查询
 
 客户端提供以下方法用于查询当前运行状态, 方便调试和 UI 展示。
 
@@ -130,53 +209,37 @@ client.GetClientStatus()            // 返回 ClientStatus_t 结构体(含 Type/
 TypeScript 客户端:
 
 ```ts
-ws.GetUiStatusToUser()              // 返回 "synced"/"syncing"/"offline"/"needManual"
-ws.GetSinceLastServerConfirm()      // 返回毫秒数。从未收到过返回 -1。
-ws.GetNeedManualMsg()               // 返回 needManual 状态的原因文本。空字符串表示不在 needManual 状态。
-ws.GetRoomCount()                   // 返回当前订阅的房间数量。
-ws.IsConnectedSucc()                // 返回 ws 是否已连接。
+client.GetUiStatusToUser()          // 返回 "synced"/"syncing"/"offline"/"needManual"
+client.GetSinceLastServerConfirm()  // 返回毫秒数。从未收到过返回 -1。
+client.GetNeedManualMsg()           // 返回 needManual 状态的原因文本。空字符串表示不在 needManual 状态。
+client.GetRoomCount()               // 返回当前订阅的房间数量。
+client.IsConnectedSucc()            // 返回 ws 是否已连接。
 ```
 
-使用示例(前端调试面板):
+前端调试面板示例:
 
 ```ts
-const status = ws.GetUiStatusToUser()
-const sinceLast = ws.GetSinceLastServerConfirm()
-const manualMsg = ws.GetNeedManualMsg()
-debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.GetRoomCount()} needManual=${manualMsg}`
+const status = client.GetUiStatusToUser()
+const sinceLast = client.GetSinceLastServerConfirm()
+const manualMsg = client.GetNeedManualMsg()
+debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${client.GetRoomCount()} needManual=${manualMsg}`
 ```
 
-## 协议要点
-
-- 二进制协议, 一个 WebSocket message 可以包含多个协议消息。
-- 每个协议消息格式: `[uint16LE 长度][消息体]`。
-- 消息类型: `ping(1)`, `setTimeCfg(2)`, `roomEnter(3)`, `roomLeave(4)`, `roomValue(5)`, `identity(6)`, `connAllow(7)`, `deny(8)`, `closeConn(9)`, `roomValueMore(10)`。
-  - `roomValueMore`: 服务端->客户端。`LiveData` 超过单 frame 上限时, 一次 `roomValue` 拆成 `[roomValueMore...][roomValue]` 分块传输(More=后面还有, 最后一片是普通 `roomValue` 携带元数据, 与不分块时同构)。同连接上整组分片连续到达、中间不插其它消息, 客户端把累积的 More 分片拼到最后那条 `roomValue` 前面重组。
-  - `identity`: 客户端->服务端首包(opaque 凭证)。
-  - `connAllow`: 服务端->客户端连接已批准(携带 `AuthEnabled`)。
-  - `deny`: 服务端->客户端拒绝(连接/房间)。
-  - `closeConn`: 服务端->客户端要求关闭(临时/永久)。
-- 认证流程: 客户端连上先发 `identity`, 服务端配置了 `OnAllowFn` 则等批准(`connAllow`)再发 `roomEnter`; 未配置则服务端立即发 `connAllow`(`AuthEnabled=false`), 零额外往返。
-- `setTimeCfg` 使用 KV 格式: `[count: uint8][ [fieldId: uint8][value: int64LE] ] * count`。`fieldId` 见 `TimeoutCfg_t` 注释, 不认识的 `fieldId` 跳过(前向兼容)。
-- 心跳: 客户端空闲时主动发 ping, 服务端回复 ping。超时未收到数据则断线重连。
-- 服务端写缓冲满时主动断开该连接(客户端太慢, 丢弃)。
-
-## 保证与不保证
+## 语义保证
 
 保证:
 
 - 在网络正常时, 客户端最终一定能感知到房间"是否发生了变化"(通过 `GProcessId`+`ChangeSeq` 去重)。
-  即: 如果服务端 `FireChange` 了, 客户端一定会收到一次 onChange 回调(去重后)。
+  即: 如果服务端 `FireChange` 了, 客户端一定会收到一次 onChange 回调(去重后);
   如果服务端没有 `FireChange`, 客户端不会收到虚假的 onChange 回调。
 - 断线重连后, 客户端重新加入房间会收到当前版本号, 如果和断线前不同则触发 onChange。
   所以客户端不会错过"最终状态有变化"这件事。
 
 不保证:
 
-- 中间状态可能丢失。比如服务端连续 `FireChange` 了 3 次(v1->v2->v3), 客户端可能只收到 v3。
-  断线重连期间的所有中间变更都会丢失, 客户端只看到重连后的最新版本。
-  客户端处理太慢, 中间变更可能会丢失。
-- `LiveData` 不保证送达。服务端写缓冲满时丢弃, 断线时丢失, 超 1024 字节时丢弃。
+- 中间状态可能丢失。比如服务端连续 `FireChange` 了 3 次(v1→v2→v3), 客户端可能只收到 v3。
+  断线重连期间的所有中间变更都会丢失, 客户端只看到重连后的最新版本。客户端处理太慢, 中间变更也可能会丢失。
+- `LiveData` 不保证送达。服务端写缓冲满时丢弃, 断线时丢失, 超过上限时丢弃。
   `LiveData` 是尽力而为的附加数据, 不是可靠传输。
 
 不实现:
@@ -198,95 +261,48 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 - 服务端不存储 `LiveData`, 客户端断线重连后不会补发之前的 `LiveData`。
 - 房间没有历史记录, 客户端只能收到订阅后的变更。
 
-## 可配置参数
+## 配置参数
 
-本 package 对外可配置的全部参数(`ServerManager` / `Client` / `TimeoutCfg_t`)及其默认值、上限、效果, 见 [`doc/config.md`](doc/config.md)。
+本 package 对外可配置的全部参数(`ServerManager` / `Client` / `TimeoutCfg_t`)及其默认值、上限、效果,
+见 [`doc/config.md`](doc/config.md)。
 
-## 典型使用模式: ws 通知 + ajax 获取
+## 协议
 
-本框架的设计意图是作为"变更通知层", 配合 ajax 获取实际数据:
+- 二进制协议, 一个 WebSocket message 可以包含多个协议消息。
+- 每个协议消息格式: `[uint16LE 长度][消息体]`。
+- 消息类型: `ping(1)`, `setTimeCfg(2)`, `roomEnter(3)`, `roomLeave(4)`, `roomValue(5)`, `identity(6)`, `connAllow(7)`, `deny(8)`, `closeConn(9)`, `roomValueMore(10)`。
+  - `roomValueMore`: 服务端→客户端。`LiveData` 超过单 frame 上限时, 一次 `roomValue` 拆成 `[roomValueMore...][roomValue]` 分块传输(More=后面还有, 最后一片是普通 `roomValue` 携带元数据, 与不分块时同构)。同连接上整组分片连续到达、中间不插其它消息, 客户端把累积的 More 分片拼到最后那条 `roomValue` 前面重组。
+  - `identity`: 客户端→服务端首包(opaque 凭证)。
+  - `connAllow`: 服务端→客户端连接已批准(携带 `AuthEnabled`)。
+  - `deny`: 服务端→客户端拒绝(连接/房间)。
+  - `closeConn`: 服务端→客户端要求关闭(临时/永久)。
+- 认证流程: 客户端连上先发 `identity`, 服务端配置了 `OnAllowFn` 则等批准(`connAllow`)再发 `roomEnter`; 未配置则服务端立即发 `connAllow`(`AuthEnabled=false`), 零额外往返。
+- `setTimeCfg` 使用 KV 格式: `[count: uint8][ [fieldId: uint8][value: int64LE] ] * count`。`fieldId` 见 `TimeoutCfg_t` 注释, 不认识的 `fieldId` 跳过(前向兼容)。
+- 心跳: 客户端空闲时主动发 ping, 服务端回复 ping。超时未收到数据则断线重连。
+- 服务端写缓冲满时主动断开该连接(客户端太慢, 丢弃)。
 
-1. 服务端数据变更时 → `FireChange(roomId)`, 可选带少量 `LiveData`。
-2. 客户端收到 onChange → 发 ajax 请求获取最新完整数据。
-3. 断线重连 → 重新加入房间 → 发现版本号变了 → ajax 取最新数据。
-
-这种模式的好处:
-
-- 事件只存内存, 不需要数据库持久化事件, 没有事件存储/清理的复杂逻辑。
-- 实际业务数据的持久化由已有的数据库负责, ws 层不重复存储。
-- 性能容易优化: `FireChange` 只是内存操作+写 ws 缓冲, 不涉及 IO。
-- 慢客户端不影响其他客户端: 写缓冲满了就断开那一个连接, 不阻塞广播。
-- 不会爆内存: 每个连接独立的固定大小写缓冲(默认 64KB), `LiveData` 不存储。
-
-对于 streaming 场景(如 AI streaming 输出)的经验:
-
-- `LiveData` 1024 字节放一次 200ms 间隔内的增量文本, 大多数情况够用(200ms 内 AI 产生的文本通常几十到几百字节)。
-- 偶尔一次增量超了 1024 字节, `LiveData` 会被丢弃, 但通知仍然发出, 前端发现 `LiveData` 为 null 时走 ajax 补取。
-- 断线重连本身就要 ajax 重新取完整状态, 所以这个降级路径本来就得有。
-- 不要试图通过 ws 推送完整的大块数据(如完整 streaming 内容), 否则会有阻塞/爆内存风险。
-  让 ws 只负责通知, 大数据走 ajax, 两条路径各司其职。
-
-为什么是"戳一下 + 拉取"而不是"直接用 ws 推内容当可靠", 以及为什么在本库约束下这已是已知最优结构(剩下只能调参数), 见 [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md)。
-
-## 适用场景
-
-本库的设计前提是 **ws 通知 + ajax(或 http rpc)取数** 两条路径配合: ws 只负责"戳一下"告诉客户端某个 room 变了, 真实数据和可靠性由业务自己的数据库 + ajax 负责(原因见 [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md))。在这个前提下:
-
-| 场景 | 是否适合 |
-| --- | --- |
-| 新消息提醒(告诉客户端"这个会话变了") | 适合 |
-| 客户端收到通知后拉取最新消息列表 | 适合 |
-| 未读数、会话列表刷新通知 | 适合 |
-| typing / 在线状态这类当前状态量 | 适合(用 `CVersionId` 存当前状态, 进房/重连自动下发, 必要时 ajax 保底) |
-| 每条聊天消息可靠送达 | 适合(ws 通知 + ajax 兜底, 见 [`example/ReliableChat/`](example/ReliableChat/); 纯靠 ws `LiveData` 当可靠送达不适合) |
-| 离线消息、消息历史、回放、断线补发 | 适合(历史存数据库 + ajax 拉取, ws 只负责戳一下, 见 [`example/ReliableChat/`](example/ReliableChat/)) |
-| 大规模多节点分布式通知 | 需要额外改造(本库是单进程房间表)。看起来有办法解决、且全广播档不用改库,理论分析见 [`doc/multiNodeDistribute.md`](doc/multiNodeDistribute.md)(**仅理论,未实践**) |
-
-## CVersionId 还是 LiveData?
-
-`FireChange` 可选携带 `CVersionId` 和 `LiveData`, 两者语义不同, 对接时容易选错:
-
-| | 服务端存储 | 进房/重连 | 适合什么 |
-| --- | --- | --- | --- |
-| `CVersionId`(≤100 字节) | 存内存当前值 | 进房/重连自动下发当前值 | **当前状态量**("是什么"): 在线/typing、未读数、数据版本号 |
-| `LiveData`(≤1024 字节) | 不存, 仅实时传一次 | 重连/缓冲满/超限就没了 | **一次性增量**("发生了什么"): 新消息、streaming 文本片段 |
-
-- **状态量用 `CVersionId`**。它是"当前完整状态", 丢一次通知没关系——下一次通知或进房/重连会带上最新值, **自动收敛到正确状态**。
-  例如 typing / 在线状态: `FireChange(RoomId, CVersionId="在线状态编码")`, 客户端 `onChange` 直接读 `ev.CVersionId` 更新 UI, **不需要 ajax**;
-  只在服务器重启(`CVersionId` 丢失、`RoomEpoch` 变化)时用 ajax 取一次当前完整状态保底。100 字节放状态编码或版本号通常够用, 不够就用 `CVersionId` 当版本号 + ajax 取完整列表。
-- **一次性增量用 `LiveData`**。丢了(缓冲满/断线/超 1024)就走 ajax 补。聊天消息属于这类(每条是新增内容, 不是"当前状态"), 见 [`example/ReliableChat/`](example/ReliableChat/)。
-
-## 例子: 可靠聊天消息 + 离线消息/历史/断线补发
-
-很多人会问: 本框架能不能做"聊天消息可靠送达"和"离线消息/消息历史/回放/断线补发"?
-答案是可以——把 ws 当"戳一下"的低延迟通道, 把 ajax(或 http rpc)当真实数据来源, 两者配合即可。
-对接代码很简单, 代价仅仅是某些情况(LiveData 不够用时)多一个 RTT。
-
-核心思路(完整可运行代码 + 自动测试见 [`example/ReliableChat/`](example/ReliableChat/)):
-
-1. 真正的可靠性锚点是**业务消息序号**(每个房间内单调递增, 存数据库), 不是 ws 层的 `ChangeSeq`
-   (`ChangeSeq` 只是"戳一下"信号, 服务器重启会重置)。
-2. 服务端每来一条消息: 先写库分配序号, 再 `FireChange`, 把整条消息塞进 `LiveData`(尽力而为)。
-3. 客户端收到 onChange:
-   - `LiveData` 有内容, 且序号正好接在本地最后一条之后 → 直接用 `LiveData` 应用, **0 额外 RTT**(快路径, 即"直接推送每一条聊天消息")。
-   - 否则(`LiveData` 没有/被丢弃/超 1024 字节/重连/服务器重启, 或者序号跳号说明中间漏了)→ **ajax 拉取本地最后序号之后的全部消息**补齐。
-4. "是不是断过线"不需要单独判断: 任何中断都会表现为"`LiveData` 缺失"或"序号跳号", 被上面的 ajax 路径统一兜住。
-   这条 ajax 路径同时就是"离线消息/历史/回放/断线补发"的实现——新客户端进房、断线重连、服务器重启后, 都靠它把缺的消息补回来。
-
-运行例子: `cd example && go run ./ReliableChat`; 跑自动测试: `cd example && go test ./ReliableChat`。
-自动测试覆盖: 逐条快路径送达、突发连发不丢消息、超大 `LiveData` 降级 ajax、进房回放历史、ws 重启后断线补发。
-
-## 例子
+## 示例
 
 所有例子在 [`example/`](example/) 目录下, 是一个**独立的 go module**(自己的 `go.mod`),
 这样浏览器真机测试用到的 chromedp 等测试依赖不会泄漏进本库(`hgmRoomNotify`)的 `go.mod`。
-运行前先 `cd hgmRoomNotify/example`。
+例子通过 `replace` 指向同仓库本体源码, 始终对着当前 commit 编译。运行前先 `cd hgmRoomNotify/example`。
 
 | 例子 | 说明 | 运行 / 测试 |
 | --- | --- | --- |
 | [`SimpleDemo/`](example/SimpleDemo/) | 最小闭环: 同进程起服务端 + Go 客户端, `FireChange` 通知。 | `go run ./SimpleDemo` / `go test ./SimpleDemo` |
 | [`ReliableChat/`](example/ReliableChat/) | ws 戳一下 + ajax 兜底实现可靠聊天: 可靠送达 / 离线消息 / 历史回放 / 断线补发(纯 Go)。 | `go run ./ReliableChat` / `go test ./ReliableChat` |
-| [`WebChat/`](example/WebChat/) | 浏览器 **React** 前端 + Go 后端(内存库)的可靠聊天室, 复用 ReliableChat 的可靠模式; 浏览器客户端编译前复制进前端(gitignore, 仓库不留第二份)。含真 Chrome 真机自动测试。 | `go run ./WebChat/WebChatRun` (一条命令自动编译前端+起后端) / `go test ./WebChat` |
+| [`WebChat/`](example/WebChat/) | 浏览器 **React** 前端 + Go 后端(内存库)的可靠聊天室, 复用 ReliableChat 的可靠模式; 浏览器客户端编译前复制进前端(gitignore, 仓库不留第二份)。含真 Chrome 真机自动测试。 | `go run ./WebChat/WebChatRun`(一条命令自动编译前端+起后端) / `go test ./WebChat` |
+
+## 设计文档
+
+`doc/` 目录下的设计与分析记录:
+
+| 文档 | 内容 |
+| --- | --- |
+| [`doc/config.md`](doc/config.md) | 全部可配置参数(`ServerManager` / `Client` / `TimeoutCfg_t`)的默认值、上限与效果。 |
+| [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md) | 为什么用"ws 戳一下 + DB 拉取"而非"ws 直推内容当可靠", 以及与 Kafka 等方案的对比。 |
+| [`doc/hotRoomFanout.md`](doc/hotRoomFanout.md) | 热房间扇出成本与合并缓冲分析(当前有意不实现合并缓冲的原因)。 |
+| [`doc/multiNodeDistribute.md`](doc/multiNodeDistribute.md) | 多节点分布式通知的理论分析(**仅理论, 未实践**)。 |
 
 ## License
 
