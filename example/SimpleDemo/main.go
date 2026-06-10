@@ -2,7 +2,8 @@
 // 服务端起一个 http server 暴露 /ws, 客户端连上去加入一个房间,
 // 然后服务端每隔一会儿 FireChange 一次, 客户端打印收到的变更.
 //
-// 运行: go run ./example
+// 运行: cd hgmRoomNotify/example && go run ./SimpleDemo
+// 自动测试: cd hgmRoomNotify/example && go test ./SimpleDemo
 package main
 
 import (

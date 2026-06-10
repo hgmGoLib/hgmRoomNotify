@@ -1,6 +1,7 @@
 package hgmRoomNotify
 
 import (
+	"strconv"
 	"sync"
 	"time"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibSync"
@@ -45,7 +46,8 @@ type Client struct {
 	TimeoutCfg zlibSync.Var[TimeoutCfg_t]
 	// 观测事件回调. nil 表示使用 ObsDefaultFn. 设置为空函数表示关闭观测.
 	ObsFn func(ev *ObsEvent_t)
-	// websocket message 最大读取字节数. 0表示使用默认值64KB.
+	// websocket message 最大读取字节数. 0表示使用默认值64KB, 负值 panic(_init 会把默认值写回本字段).
+	// 必须 >= 服务端 WriteBufMaxBytes(单个 websocket message 最大可达该值), 否则会因消息过大断开.
 	ReadMsgMaxBytes int
 
 	thisConn atomic.Pointer[client_conn]
@@ -119,6 +121,10 @@ type client_conn struct {
 	authResolvedCh   chan struct{}
 	connApproved     bool // 仅在 authResolvedCh 关闭后由主 goroutine 读取.
 	connDenied       bool
+
+	// 大 LiveData 分块重组缓冲. roomValueMore 累积分片, 末条 roomValue 拼出完整 LiveData 后清空.
+	// 仅在本连接的 readThread 单 goroutine 内读写, 无需加锁. 连接重建时随 client_conn 一起丢弃.
+	roomValueReassembleBuf []byte
 }
 func (tc *client_conn) resolveAuth(){
 	tc.authResolvedOnce.Do(func(){
@@ -132,6 +138,13 @@ func (c *Client) _init_afterEnter(){
 	c.connSingleUnd.Do(func() {
 		// 这个里面阻塞等待连接关闭.
 		c.initOnce.Do(func() {
+			// ReadMsgMaxBytes: 0 把默认 64KB 写回字段本身, 负值是调用者 bug 直接 panic. 之后读取点直接读字段.
+			if c.ReadMsgMaxBytes < 0 {
+				panic("hgmRoomNotify: Client.ReadMsgMaxBytes must not be negative, got " + strconv.Itoa(c.ReadMsgMaxBytes))
+			}
+			if c.ReadMsgMaxBytes == 0 {
+				c.ReadMsgMaxBytes = 64 * 1024 // 默认 64KB.
+			}
 			c.TimeoutCfg.LockCb(func(t *TimeoutCfg_t) {
 				t.InitWithDefault()
 			})
@@ -222,11 +235,6 @@ func (c *Client) tryConnOnceSync() (isContinue bool){
 		return true
 	}
 	c.logStatus(ClientStatus_connected)
-	clientMaxRead:=c.ReadMsgMaxBytes
-	if clientMaxRead<=0{
-		clientMaxRead = 64*1024
-	}
-	ctx3.Conn.MaxReadMsgSize = uint32(clientMaxRead)
 	thisConn:=&client_conn{
 		conn: conn_frame_t{raw: &ctx3.Conn},
 		c:    c,
@@ -288,38 +296,22 @@ func (c *Client) tryConnOnceSync() (isContinue bool){
 				c.TimeoutCfg.Set(*cfg)
 			}
 		case Cmd_roomValue:
-			roomId:=msg.RoomId
-			c.roomLock.Lock()
-			room,hasRoom:=c.roomMap[roomId]
-			if hasRoom==false{
-				c.roomLock.Unlock()
+			// 前面有 roomValueMore 累积分片时, 本条即为分块序列的最后一片, 把累积分片拼到它前面;
+			// 没有累积分片时(常见的不分块情形)直接用本条 LiveData, 零额外拷贝.
+			liveData := msg.LiveData
+			if thisConn.roomValueReassembleBuf != nil {
+				liveData = append(thisConn.roomValueReassembleBuf, msg.LiveData...)
+				thisConn.roomValueReassembleBuf = nil
+			}
+			c.onRoomValue(msg.RoomId, msg.RoomEpoch, msg.ChangeSeq, msg.CVersionId, liveData)
+		case Cmd_roomValueMore:
+			// 累积一段 LiveData 分片. 上限 = ReadMsgMaxBytes(整组分片本就在单个 websocket message 内, 不会超).
+			if len(thisConn.roomValueReassembleBuf)+len(msg.LiveData) > c.ReadMsgMaxBytes{
+				c.logClose(CloseReason_protocolNoMatch, "roomValue reassemble overflow")
+				thisConn.conn.closer.Close2()
 				return
 			}
-			if msg.RoomEpoch!=room.RoomEpoch{
-				// 房间纪元变了(房间被重建或服务器重启), 无条件接受.
-				room.RoomEpoch = msg.RoomEpoch
-				room.ChangeSeq = msg.ChangeSeq
-				room.CVersionId = msg.CVersionId
-			}else if msg.ChangeSeq>room.ChangeSeq{
-				// 同纪元有新变化.
-				room.ChangeSeq = msg.ChangeSeq
-				room.CVersionId = msg.CVersionId
-			}else{
-				// 旧消息(竞争产生的), 整条忽略.
-				c.roomLock.Unlock()
-				return
-			}
-			ev:=RoomOnChange_t{
-				RoomId:     roomId,
-				RoomEpoch:  room.RoomEpoch,
-				ChangeSeq:  room.ChangeSeq,
-				CVersionId: room.CVersionId,
-				LiveData:   msg.LiveData,
-			}
-			for listener:=range room.listenerSet{
-				listener.onChangeAsync(ev)
-			}
-			c.roomLock.Unlock()
+			thisConn.roomValueReassembleBuf = append(thisConn.roomValueReassembleBuf, msg.LiveData...)
 		case Cmd_connAllow:
 			// 连接被批准. 清掉连接级 deny 状态(重连重新认证通过), 唤醒主 goroutine 去发 roomEnter.
 			c.connDenyLocal.Set(false)

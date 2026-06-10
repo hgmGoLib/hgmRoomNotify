@@ -1,7 +1,7 @@
 // ReliableChat: 用 hgmRoomNotify(ws 戳一下) + ajax(取真实数据) 实现可靠聊天消息送达
 // 以及离线消息/历史/回放/断线补发. 完整对接逻辑见同目录其它文件, 自动测试见 chat_test.go.
 //
-// 运行: go run ./example/ReliableChat
+// 运行: cd hgmRoomNotify/example && go run ./ReliableChat
 package main
 
 import (

@@ -1,0 +1,4 @@
+node_modules/
+dist/
+# 编译前从 hgmRoomNotify/hgmRoomNotifyBrowserTs 复制进来的客户端副本, 不入库.
+src/hgmRoomNotifyBrowserTs/

@@ -10,8 +10,9 @@
 运行:
 
 ```
-go run ./example/ReliableChat      # 跑 demo
-go test ./example/ReliableChat/    # 跑自动测试
+cd hgmRoomNotify/example
+go run ./ReliableChat      # 跑 demo
+go test ./ReliableChat     # 跑自动测试
 ```
 
 ## 一句话原理

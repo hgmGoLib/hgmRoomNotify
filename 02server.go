@@ -8,6 +8,7 @@ import (
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibSync"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibTimer"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibChannel"
+	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibVnet"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibWebsocket2"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibIdGen"
 	"github.com/hgmGoLib/hgmRoomNotify/pkg/zlibCloser"
@@ -17,7 +18,7 @@ import (
 // FireChange的输入参数.
 type RoomEvent_t struct {
 	RoomId string
-	LiveData []byte // 可选. 调用者负责序列化. 超过1024字节则静默忽略.
+	LiveData []byte // 可选. 调用者负责序列化. 超过 ServerManager.LiveDataMaxSize(默认1024) 则该次静默忽略(发 obs). 超过单 frame 时自动分块传输.
 	CVersionId string // 可选. 自定义版本id. 最大100字节,超过panic. 用于调用者追踪实际数据变化.
 }
 type ServerManager struct{
@@ -32,10 +33,16 @@ type ServerManager struct{
 	OnAllowFn func(ctx *ServerOnAllow_ctx_t)
 	// 观测事件回调. nil 表示使用 ObsDefaultFn. 设置为空函数表示关闭观测.
 	ObsFn func(ev *ObsEvent_t)
-	// 单连接最大房间数. 0表示使用默认值1024. 超过上限会给客户端报错并断开连接.
+	// 单连接最大房间数. 0表示使用默认值1024, 负值 _init 时 panic. 超过上限会给客户端报错并断开连接.
 	RoomEnterMaxPerConn int
-	// 写入缓冲最大字节数. 0表示使用默认值64KB. 调用者发现缓冲满了服务端主动断开连接.
+	// 写入缓冲最大字节数(每条连接). 0表示使用默认值64KB, 最大可配置 64MB(负值或超限 _init 时 panic). 调用者发现缓冲满了服务端主动断开连接.
+	// 注意: 调大后客户端的 ReadMsgMaxBytes 必须 >= 本值(单个 websocket message 最大可达本值), 否则客户端会因消息过大断开.
+	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再更改(并发安全靠此文档约束, 不加锁/atomic; _init 会把默认值写回本字段).
 	WriteBufMaxBytes int
+	// 单次 LiveData 最大字节数. 0表示使用默认值1024, 最大可配置 16MB(负值或超限 _init 时 panic). 超过则该次 FireChange 的 LiveData 被静默丢弃(发 obs).
+	// 必须 <= WriteBufMaxBytes 的 25%, 否则 _init 时 panic. 超过单 frame 上限时自动用 roomValueMore...roomValue 分块传输.
+	// 本字段必须在首次调用 API(ServeHTTP/FireChange) 之前配置好, 之后不再更改(并发安全靠此文档约束, 不加锁/atomic; _init 会把默认值写回本字段).
+	LiveDataMaxSize int
 
 	connCount atomic.Int64
 	roomMapLock sync.Mutex
@@ -91,6 +98,36 @@ type room_t struct {
 }
 func (s *ServerManager) _init(){
 	s.initOnce.Do(func(){
+		// 三个 "0=默认值" 的 int 配置: 负值是调用者 bug 直接 panic(不能把负值静默当默认值, 会掩盖错误);
+		// 为 0 则把默认值写回字段本身, 之后所有读取点直接读字段, 不再各自处理默认值.
+		if s.WriteBufMaxBytes < 0 {
+			panic("hgmRoomNotify: WriteBufMaxBytes must not be negative, got " + strconv.Itoa(s.WriteBufMaxBytes))
+		}
+		if s.WriteBufMaxBytes == 0 {
+			s.WriteBufMaxBytes = 64 * 1024 // 默认 64KB.
+		}
+		if s.WriteBufMaxBytes > 64*1024*1024 { // 最大 64MB.
+			panic("hgmRoomNotify: WriteBufMaxBytes too large, max 64MB, got " + strconv.Itoa(s.WriteBufMaxBytes))
+		}
+		if s.LiveDataMaxSize < 0 {
+			panic("hgmRoomNotify: LiveDataMaxSize must not be negative, got " + strconv.Itoa(s.LiveDataMaxSize))
+		}
+		if s.LiveDataMaxSize == 0 {
+			s.LiveDataMaxSize = 1024 // 默认 1024 字节.
+		}
+		if s.LiveDataMaxSize > 16*1024*1024 { // 最大 16MB.
+			panic("hgmRoomNotify: LiveDataMaxSize too large, max 16MB, got " + strconv.Itoa(s.LiveDataMaxSize))
+		}
+		// LiveData 上限不能超过写缓冲的 25%(否则单条大 LiveData 容易撑满缓冲导致断连).
+		if s.LiveDataMaxSize > s.WriteBufMaxBytes/4 {
+			panic("hgmRoomNotify: LiveDataMaxSize(" + strconv.Itoa(s.LiveDataMaxSize) + ") must be <= 25% of WriteBufMaxBytes(" + strconv.Itoa(s.WriteBufMaxBytes) + ")")
+		}
+		if s.RoomEnterMaxPerConn < 0 {
+			panic("hgmRoomNotify: RoomEnterMaxPerConn must not be negative, got " + strconv.Itoa(s.RoomEnterMaxPerConn))
+		}
+		if s.RoomEnterMaxPerConn == 0 {
+			s.RoomEnterMaxPerConn = 1024 // 默认 1024.
+		}
 		s.TimeoutCfg.LockCb(func(t *TimeoutCfg_t) {
 			t.InitWithDefault()
 		})
@@ -145,10 +182,6 @@ func (s *ServerManager) ServeHTTP(w http.ResponseWriter, r *http.Request){
 		http.Error(w, ctx3.ErrMsg, 400)
 		return
 	}
-	maxBufBytes:=s.WriteBufMaxBytes
-	if maxBufBytes<=0{
-		maxBufBytes = 64*1024
-	}
 	useAuthQueue := s.OnAllowFn != nil
 	sconn :=&server_conn_t{
 		roomMap:         map[string]*room_t{},
@@ -163,19 +196,16 @@ func (s *ServerManager) ServeHTTP(w http.ResponseWriter, r *http.Request){
 		sconn:        sconn,
 	}
 	if useAuthQueue {
-		maxRooms := s.RoomEnterMaxPerConn
-		if maxRooms <= 0 {
-			maxRooms = 1024
-		}
-		sconn.cmdCh = make(chan Msg_t, maxRooms+2)
+		sconn.cmdCh = make(chan Msg_t, s.RoomEnterMaxPerConn+2)
 	}
-	// 写缓冲在每个发送批次前预留 websocket 帧头空间(GetFrameBufPrefixPreservedSize), 使 WriteFrame 原地写头零 copy.
+	// 写缓冲在每个发送批次前后预留下层帧头/帧尾空间(GetFrameBufPreservedSize), 使 WriteFrame 原地写头/尾零 copy;
+	// 并按下层最终写入硬限(Frame16MaxWriteSize)减去前后预留, 封顶单批 payload.
+	ps := ctx3.Conn.GetFrameBufPreservedSize()
 	sconn.writeBuf = server_conn_write_buf_t{
-		bipBuf: zlibChannel.NewFrame16BipBuf2(uint32(maxBufBytes), ctx3.Conn.GetFrameBufPrefixPreservedSize()),
+		bipBuf: zlibChannel.NewFrame16BipBuf2(uint32(s.WriteBufMaxBytes), ps.Prefix, ps.Suffix, zlibVnet.Frame16MaxWriteSize-uint32(ps.Prefix)-uint32(ps.Suffix)),
 		sconn:  sconn,
 	}
 	sconn.registerSessionKey(ctx2.SessionId)
-	ctx3.Conn.MaxReadMsgSize = uint32(maxBufBytes)
 	sconn.conn.raw = &ctx3.Conn
 	// 未认证连接的超时关闭: 启用了认证(OnAllowFn!=nil)但连接还没认证通过(没收到 identity 或没批准).
 	if useAuthQueue {
@@ -306,7 +336,11 @@ func (s *ServerManager) ServeHTTP(w http.ResponseWriter, r *http.Request){
 }
 
 func (sconn *server_conn_t) sendMsgNoBlock(msg Msg_t){
-	result:=sconn.writeBuf.pushMsg(msg)
+	sconn.handlePushResult(sconn.writeBuf.pushMsg(msg), msg.RoomId)
+}
+
+// 处理 pushMsg/pushMsgsAtomic 的返回码: msgTooLarge/bufFull 发 obs 并主动关闭连接, broken 忽略.
+func (sconn *server_conn_t) handlePushResult(result pushMsgResult_t, roomId string){
 	switch result {
 	case pushMsgResult_ok:
 		return
@@ -315,9 +349,9 @@ func (sconn *server_conn_t) sendMsgNoBlock(msg Msg_t){
 			ev.Type = ObsEventType_serverMsgTooLarge
 			ev.RemoteAddr = sconn.remoteAddr
 			ev.SessionId = sconn.sessionId
-			ev.RoomId = msg.RoomId
+			ev.RoomId = roomId
 		})
-		sconn.setObsCloseReason("msgTooLarge", "roomId="+msg.RoomId)
+		sconn.setObsCloseReason("msgTooLarge", "roomId="+roomId)
 		sconn.conn.closer.Close2()
 	case pushMsgResult_broken:
 		// 连接已断开, 不需要再关闭.
@@ -326,9 +360,9 @@ func (sconn *server_conn_t) sendMsgNoBlock(msg Msg_t){
 			ev.Type = ObsEventType_serverWriteBufFull
 			ev.RemoteAddr = sconn.remoteAddr
 			ev.SessionId = sconn.sessionId
-			ev.RoomId = msg.RoomId
+			ev.RoomId = roomId
 		})
-		sconn.setObsCloseReason("writeBufFull", "roomId="+msg.RoomId)
+		sconn.setObsCloseReason("writeBufFull", "roomId="+roomId)
 		sconn.conn.closer.Close2()
 	}
 }
@@ -348,9 +382,9 @@ func (s *ServerManager) FireChange(ev RoomEvent_t){
 		panic("hgmRoomNotify: CVersionId too long, max 100 bytes, got " + strconv.Itoa(len(ev.CVersionId)))
 	}
 	var liveBuf []byte
-	if len(ev.LiveData) > 0 && len(ev.LiveData) <= 1024 {
+	if len(ev.LiveData) > 0 && len(ev.LiveData) <= s.LiveDataMaxSize {
 		liveBuf = ev.LiveData
-	} else if len(ev.LiveData) > 1024 {
+	} else if len(ev.LiveData) > s.LiveDataMaxSize {
 		_emitObs(s.ObsFn, func(oev *ObsEvent_t) {
 			oev.Type = ObsEventType_serverLiveDataDropped
 			oev.RoomId = ev.RoomId
@@ -379,14 +413,7 @@ func (s *ServerManager) FireChange(ev RoomEvent_t){
 	}
 	s.roomMapLock.Unlock()
 	for _,conn:=range connList{
-		conn.sendMsgNoBlock(Msg_t{
-			Cmd:        Cmd_roomValue,
-			RoomEpoch:  roomEpoch,
-			ChangeSeq:  changeSeq,
-			RoomId:     ev.RoomId,
-			CVersionId: cVersionId,
-			LiveData:   liveBuf,
-		})
+		conn.sendRoomValue(roomEpoch, changeSeq, ev.RoomId, cVersionId, liveBuf)
 	}
 	_emitObs(s.ObsFn, func(oev *ObsEvent_t) {
 		oev.Type = ObsEventType_serverFireChange

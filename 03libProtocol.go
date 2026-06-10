@@ -36,6 +36,10 @@ const Cmd_identity Cmd_t = 6   // 客户端->服务端. 连接后首包. 携带 
 const Cmd_connAllow Cmd_t = 7  // 服务端->客户端. 连接已批准. 携带 AuthEnabled(服务端是否启用认证).
 const Cmd_deny Cmd_t = 8       // 服务端->客户端. 拒绝(连接或房间). DenyScope+RoomId+Reason.
 const Cmd_closeConn Cmd_t = 9  // 服务端->客户端. 要求客户端关闭连接. IsTemp+Reason.
+// LiveData 超过单 frame 上限时, 一次 roomValue 拆成 [roomValueMore...][roomValue] 分块传输(服务端->客户端).
+// roomValueMore 只携带一段 LiveData 分片(后面还有); 最后一段用普通 Cmd_roomValue(携带全部元数据), 与不分块时的单条 roomValue 同构.
+// 同一连接上一次分块序列由写缓冲原子整组写入, 中间不会插入其它消息, 客户端把之前累积的 roomValueMore 分片拼到收到的 roomValue 前面即可.
+const Cmd_roomValueMore Cmd_t = 10 // 服务端->客户端. LiveData 分片, 后面还有. LiveData(分片) 有效.
 
 // Cmd_deny 的 DenyScope 取值.
 type DenyScope_t = uint8
@@ -58,7 +62,7 @@ type Msg_t struct {
 	RoomEpoch    string // 房间纪元id. 每次房间被创建时由 zlibIdGen.NewId() 生成. 用于检测房间被重建(包括服务器重启).
 	ChangeSeq    uint64 // 变化序号. 同一个 RoomEpoch 下递增表示有新变化.
 	CVersionId   string // 自定义版本id. 服务器内存存储该数据. 调用者用于追踪实际数据变化. 最大100字节.
-	LiveData     []byte // 事件发生时的附加实时数据. 本模块不存储. 最大1024字节.
+	LiveData     []byte // 事件发生时的附加实时数据. 本模块不存储. 默认上限1024字节, 可由服务端 LiveDataMaxSize 调大(最大16MB). 超过单 frame 时拆分为 roomValueMore...roomValue.
 	TimeoutCfg   *TimeoutCfg_t
 	Identity     string    // Cmd_identity. opaque 凭证. 最大65535字节.
 	AuthEnabled  bool      // Cmd_connAllow. 服务端是否配置了认证(用于客户端"漏接 onDenyFn 当场告警").
@@ -73,6 +77,7 @@ type Msg_t struct {
 // Cmd_roomEnter:     [Cmd: uint8][RoomId: uint16LE长度 + 内容]
 // Cmd_roomLeave:     [Cmd: uint8][RoomId: uint16LE长度 + 内容]
 // Cmd_roomValue:     [Cmd: uint8][RoomId: uint16LE长度 + 内容][RoomEpoch: uint8长度 + 内容][ChangeSeq: uvarint][CVersionId: uint8长度 + 内容][LiveData: uint16LE长度 + 内容]
+// Cmd_roomValueMore: [Cmd: uint8][LiveData分片: uint16LE长度 + 内容]
 // Cmd_identity:      [Cmd: uint8][Identity: uint16LE长度 + 内容]
 // Cmd_connAllow:     [Cmd: uint8][AuthEnabled: uint8]
 // Cmd_deny:          [Cmd: uint8][DenyScope: uint8][RoomId: uint16LE长度 + 内容][Reason: uint16LE长度 + 内容]
@@ -136,6 +141,11 @@ func (msg *Msg_t) BinarySize() (size int, errMsg string) {
 			return 0, "LiveData too long, max 65535 bytes, got " + strconv.Itoa(len(msg.LiveData))
 		}
 		return 1 + (2+len(msg.RoomId)) + (1+len(msg.RoomEpoch)) + getUvarintOutputSize(msg.ChangeSeq) + (1+len(msg.CVersionId)) + (2+len(msg.LiveData)), ""
+	case Cmd_roomValueMore:
+		if len(msg.LiveData) > 65535 {
+			return 0, "LiveData chunk too long, max 65535 bytes, got " + strconv.Itoa(len(msg.LiveData))
+		}
+		return 1 + (2+len(msg.LiveData)), ""
 	default:
 		return 0, "unknown cmd " + strconv.Itoa(int(msg.Cmd))
 	}
@@ -197,6 +207,10 @@ func (msg *Msg_t) MarshalBinaryInto(buf []byte) {
 		pos += copy(buf[pos:], msg.CVersionId)
 		binary.LittleEndian.PutUint16(buf[pos:], uint16(len(msg.LiveData))); pos += 2
 		copy(buf[pos:], msg.LiveData)
+	case Cmd_roomValueMore:
+		pos := 1
+		binary.LittleEndian.PutUint16(buf[pos:], uint16(len(msg.LiveData))); pos += 2
+		copy(buf[pos:], msg.LiveData)
 	}
 }
 
@@ -247,6 +261,9 @@ func (msg *Msg_t) MarshalBinaryTo(w *zlibBytes.BufWriter) {
 		w.WriteUvarint(msg.ChangeSeq)
 		w.WriteByte_(uint8(len(msg.CVersionId)))
 		w.WriteString_(msg.CVersionId)
+		w.WriteLittleEndUint16(uint16(len(msg.LiveData)))
+		w.Write_(msg.LiveData)
+	case Cmd_roomValueMore:
 		w.WriteLittleEndUint16(uint16(len(msg.LiveData)))
 		w.Write_(msg.LiveData)
 	}
@@ -412,6 +429,19 @@ func UnmarshalMsg(data []byte) (msg Msg_t, errMsg string) {
 			copy(msg.LiveData, data[pos:pos+dataLen])
 		}
 		return msg, ""
+	case Cmd_roomValueMore:
+		if pos+2 > len(data) {
+			return msg, "data too short for chunk len"
+		}
+		chunkLen := int(binary.LittleEndian.Uint16(data[pos:])); pos += 2
+		if pos+chunkLen > len(data) {
+			return msg, "chunk field overflow"
+		}
+		if chunkLen > 0 {
+			msg.LiveData = make([]byte, chunkLen)
+			copy(msg.LiveData, data[pos:pos+chunkLen])
+		}
+		return msg, ""
 	default:
 		return msg, "unknown cmd"
 	}
@@ -485,6 +515,13 @@ func (c *conn_frame_t) readThread(){
 		}
 	}
 }
+// 单条消息序列化体积上限 = 下层单批 payload 上限(最终写入硬限减去下层前后预留)再减去子帧 2 字节长度头.
+// 连接建立后固定.
+func (c *conn_frame_t) maxSingleMsgSize() int {
+	ps := c.raw.GetFrameBufPreservedSize()
+	return int(zlibVnet.Frame16MaxWriteSize) - int(ps.Prefix) - int(ps.Suffix) - 2
+}
+
 // 序列化并发送单条消息, 带uint16长度前缀. 客户端使用.
 // 注意: uint16(msgSize) 不会溢出, 因为客户端只发送 ping(1字节)/roomEnter/roomLeave(最大1027字节),
 // 远小于 uint16 最大值 65535.
@@ -495,7 +532,7 @@ func (c *conn_frame_t) writeMsg(msg Msg_t) {
 		c.closer.Close2()
 		return
 	}
-	prefix:=int(c.raw.GetFrameBufPrefixPreservedSize())
+	prefix:=int(c.raw.GetFrameBufPreservedSize().Prefix)
 	c.writeLock.Lock()
 	c.writeBufW.Reset()
 	// 前面留出 prefix 字节给 websocket 帧头(WriteFrame 原地写头, 零 copy), 子帧 [uint16 len][msg] 从 prefix 处开始.

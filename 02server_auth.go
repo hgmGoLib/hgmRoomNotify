@@ -141,18 +141,14 @@ func (sconn *server_conn_t) doRoomEnter(roomId string) {
 		s.roomMapLock.Unlock()
 		return
 	}
-	maxRooms := s.RoomEnterMaxPerConn
-	if maxRooms <= 0 {
-		maxRooms = 1024
-	}
-	if len(sconn.roomMap) >= maxRooms {
+	if len(sconn.roomMap) >= s.RoomEnterMaxPerConn {
 		s.roomMapLock.Unlock()
 		_emitObs(s.ObsFn, func(ev *ObsEvent_t) {
 			ev.Type = ObsEventType_serverRoomOverLimit
 			ev.RemoteAddr = sconn.remoteAddr
 			ev.SessionId = sconn.sessionId
 		})
-		sconn.setObsCloseReason("roomOverLimit", "limit="+strconv.Itoa(maxRooms))
+		sconn.setObsCloseReason("roomOverLimit", "limit="+strconv.Itoa(s.RoomEnterMaxPerConn))
 		sconn.conn.closer.Close2()
 		return
 	}
