@@ -12,33 +12,31 @@
 
 ## 怎么启动
 
+一条命令搞定（编译前端 + 起后端都在里面）：
+
 ```bash
-# 1. 打包前端（React -> web/dist/app.js）
-cd hgmRoomNotify/example/WebChat/web
-npm install
-npm run build
-
-# 2. 起后端（默认 127.0.0.1:8080，把打包好的页面发出去）
-cd ..              # 回到 hgmRoomNotify/example/WebChat
-cd ..              # 回到 hgmRoomNotify/example
-go run ./WebChat
-
-# 3. 浏览器打开 http://127.0.0.1:8080
-#    多开几个标签页，互相发消息即可。
+cd hgmRoomNotify/example
+go run ./WebChat/WebChatRun
+# 浏览器打开 http://127.0.0.1:8080 , 多开几个标签页互相发消息即可。
 ```
 
-前端改了代码用 `npm run dev`（esbuild watch 模式）自动重打包，后端不用重启（页面刷新即可）。
+`WebChatRun/main.go` 先用一个 `.go` 文件向上定位到 `hgmRoomNotify` 开源项目根
+（锚是 `go.mod` 里的 `module github.com/hgmGoLib/hgmRoomNotify` 行，不写死 `../` 层数，子树怎么挪都不怕），
+再相对项目根做编译逻辑：缺依赖先 `npm install`，再 `npm run build`（prebuild 钩子复制客户端 TS + esbuild
+打包 React 到 `web/dist/app.js`），最后起后端把内嵌好前端 JS 的页面发出去。在哪个目录敲命令都行。
+
+只改前端、想要热打包，可在 `web/` 下跑 `npm run dev`（esbuild watch），后端不用重启（页面刷新即可）。
 
 ## 后端做了什么
 
 | 路由 | 作用 | 代码 |
 | --- | --- | --- |
-| `/ws` | `hgmRoomNotify` 的通知通道（戳一下） | `chat_server.go: routes` |
+| `/ws` | `hgmRoomNotify` 的通知通道（戳一下） | `chat_server.go: Routes` |
 | `/chat/post` | 浏览器发消息（POST）：写内存库分配 `MsgIndex` + `FireChange` | `chat_server.go: handlePost` |
 | `/chat/after` | ajax 取真实数据：返回 `MsgIndex > after` 的全部消息 | `chat_server.go: handleAfter` |
-| `/` | 返回内嵌前端 JS 的页面，并种 `chatSession` cookie（断线重连用） | `chat_server.go: routes` |
+| `/` | 返回内嵌前端 JS 的页面，并种 `chatSession` cookie（断线重连用） | `chat_server.go: Routes` |
 
-数据库就是 `chat_store.go` 里的纯内存 `chatStore_t`，进程重启即清空。
+数据库就是 `chat_store.go` 里的纯内存 `ChatStore_t`，进程重启即清空。
 
 ## 前端做了什么（可靠对接的核心）
 
@@ -58,7 +56,8 @@ cd hgmRoomNotify/example
 go test ./WebChat          # 无需先 npm build，测试内部会自动打包
 ```
 
-测试（`webchat_test.go`）沿用 `hgmRoomNotifyTest/hgmRoomNotifyBrowserTest` 的模式：
-跑 `npm run build`（自动复制客户端 + esbuild 打包）→ 起真后端 → 用真 Chrome（`hgmChromeDp`）加载页面，
+测试（`webchat_test.go`）沿用 `hgmRoomNotifyTest/hgmRoomNotifyBrowserTest` 的模式，
+并和一键入口复用同一套定位+编译逻辑（`repo_build.go` 的 `FindHgmRoomNotifyRoot` / `BuildFrontend`）：
+定位项目根 → `npm run build`（自动复制客户端 + esbuild 打包）→ 起真后端 → 用真 Chrome（`hgmChromeDp`）加载页面，
 验证正常路径：浏览器连上进房间、收到服务端推的消息、在页面里真实输入并点发送、渲染结果与后端内存库一致。
 （首次运行若 `web/node_modules` 不存在会自动 `npm install`。异常路径本次不测。）

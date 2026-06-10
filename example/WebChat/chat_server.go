@@ -1,4 +1,4 @@
-package main
+package webchat
 
 import (
 	"crypto/rand"
@@ -12,21 +12,21 @@ import (
 	"github.com/hgmGoLib/hgmRoomNotify"
 )
 
-// 聊天服务端: 把 chatStore_t(内存库) 和 hgmRoomNotify.ServerManager(ws 戳一下层) 接到一起,
+// 聊天服务端: 把 ChatStore_t(内存库) 和 hgmRoomNotify.ServerManager(ws 戳一下层) 接到一起,
 // 再加一个 /chat/post 给浏览器发消息. wsServer 用 atomic.Pointer 持有, 方便演示 "ws 进程重启".
-type chatServer_t struct {
-	store    *chatStore_t
+type ChatServer_t struct {
+	store    *ChatStore_t
 	wsServer atomic.Pointer[hgmRoomNotify.ServerManager]
 }
 
-func newChatServer(store *chatStore_t) *chatServer_t {
-	cs := &chatServer_t{store: store}
+func NewChatServer(store *ChatStore_t) *ChatServer_t {
+	cs := &ChatServer_t{store: store}
 	cs.wsServer.Store(cs.newWsServer())
 	return cs
 }
 
 // 新建一个 ws 层实例. 从 cookie 读 sessionId(用于 CloseConnBySessionId 踢连接演示重连).
-func (cs *chatServer_t) newWsServer() *hgmRoomNotify.ServerManager {
+func (cs *ChatServer_t) newWsServer() *hgmRoomNotify.ServerManager {
 	sm := &hgmRoomNotify.ServerManager{
 		OnAcceptFn: func(ctx *hgmRoomNotify.ServerOnAccept_ctx_t) {
 			if c, err := ctx.R.Cookie("chatSession"); err == nil {
@@ -43,7 +43,7 @@ func (cs *chatServer_t) newWsServer() *hgmRoomNotify.ServerManager {
 
 // 发一条聊天消息: 先写库分配 MsgIndex, 再 FireChange 把整条消息塞进 LiveData(尽力而为的快路径).
 // LiveData 超过 LiveDataMaxSize 会被库静默丢弃(只发通知不带 LiveData), 客户端那边自动走 ajax 兜底.
-func (cs *chatServer_t) Post(roomId string, sender string, text string) ChatMsg_t {
+func (cs *ChatServer_t) Post(roomId string, sender string, text string) ChatMsg_t {
 	m := cs.store.Post(roomId, sender, text)
 	live, _ := json.Marshal(m)
 	cs.wsServer.Load().FireChange(hgmRoomNotify.RoomEvent_t{
@@ -59,7 +59,7 @@ func (cs *chatServer_t) Post(roomId string, sender string, text string) ChatMsg_
 //   - /chat/after : ajax 取真实消息数据(GET, 返回 MsgIndex > after 的全部).
 //   - /chat/post  : 浏览器发消息(POST).
 //   - /           : 前端页面, 顺便给浏览器种一个 chatSession cookie(用于断线重连演示).
-func (cs *chatServer_t) routes(pageHtml string) *http.ServeMux {
+func (cs *ChatServer_t) Routes(pageHtml string) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		cs.wsServer.Load().ServeHTTP(w, r)
@@ -81,7 +81,7 @@ func (cs *chatServer_t) routes(pageHtml string) *http.ServeMux {
 }
 
 // ajax 接口: 返回 roomId 房间内 MsgIndex > after 的全部消息(客户端 lastIndex 之后还没拿到的).
-func (cs *chatServer_t) handleAfter(w http.ResponseWriter, r *http.Request) {
+func (cs *ChatServer_t) handleAfter(w http.ResponseWriter, r *http.Request) {
 	roomId := r.URL.Query().Get("roomId")
 	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
 	msgs := cs.store.After(roomId, after)
@@ -93,7 +93,7 @@ func (cs *chatServer_t) handleAfter(w http.ResponseWriter, r *http.Request) {
 }
 
 // 浏览器发消息接口(POST JSON {RoomId,Sender,Text}). 写库 + FireChange, 返回写入后的完整消息.
-func (cs *chatServer_t) handlePost(w http.ResponseWriter, r *http.Request) {
+func (cs *ChatServer_t) handlePost(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return

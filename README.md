@@ -286,7 +286,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${ws.G
 | --- | --- | --- |
 | [`SimpleDemo/`](example/SimpleDemo/) | 最小闭环: 同进程起服务端 + Go 客户端, `FireChange` 通知。 | `go run ./SimpleDemo` / `go test ./SimpleDemo` |
 | [`ReliableChat/`](example/ReliableChat/) | ws 戳一下 + ajax 兜底实现可靠聊天: 可靠送达 / 离线消息 / 历史回放 / 断线补发(纯 Go)。 | `go run ./ReliableChat` / `go test ./ReliableChat` |
-| [`WebChat/`](example/WebChat/) | 浏览器 **React** 前端 + Go 后端(内存库)的可靠聊天室, 复用 ReliableChat 的可靠模式; 浏览器客户端编译前复制进前端(gitignore, 仓库不留第二份)。含真 Chrome 真机自动测试。 | 见 [`WebChat/README.md`](example/WebChat/) (先 `npm install && npm run build`) / `go test ./WebChat` |
+| [`WebChat/`](example/WebChat/) | 浏览器 **React** 前端 + Go 后端(内存库)的可靠聊天室, 复用 ReliableChat 的可靠模式; 浏览器客户端编译前复制进前端(gitignore, 仓库不留第二份)。含真 Chrome 真机自动测试。 | `go run ./WebChat/WebChatRun` (一条命令自动编译前端+起后端) / `go test ./WebChat` |
 
 ## License
 

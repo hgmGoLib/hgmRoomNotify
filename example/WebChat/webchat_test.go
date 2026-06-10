@@ -1,16 +1,11 @@
-package main
+package webchat
 
 import (
-	"bytes"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"v12w.x34y.com/bronze1man/hgmLib/hgmChromeDp"
-	"v12w.x34y.com/bronze1man/hgmLib/hgmFilePath/hgmFpGowork"
 	"v12w.x34y.com/bronze1man/hgmLib/hgmTest"
 	"v12w.x34y.com/bronze1man/hgmLib/hgmTest/hgmTestTimeout"
 )
@@ -28,11 +23,15 @@ func TestWebChat_NormalPath(t *testing.T) {
 	defer hgmTestTimeout.Stop()
 
 	const roomId = "chat:room1"
-	js := buildWebChatJs(t)
+	// 走和真人/一键入口一模一样的编译流程: 向上定位项目根 -> 相对它 npm 打包前端.
+	js, err := BuildFrontend(FindHgmRoomNotifyRoot())
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	store := &chatStore_t{}
-	cs := newChatServer(store)
-	httpServer := httptest.NewServer(cs.routes(buildPage(js, roomId, "alice")))
+	store := &ChatStore_t{}
+	cs := NewChatServer(store)
+	httpServer := httptest.NewServer(cs.Routes(BuildPage(string(js), roomId, "alice")))
 	defer httpServer.Close()
 
 	ctx := newChromeCtx()
@@ -69,35 +68,6 @@ func TestWebChat_NormalPath(t *testing.T) {
 	hgmTest.Equal(want[1].Sender+": "+want[1].Text, "alice: hi from alice")
 	// 全程连接保持.
 	hgmTest.Equal(evalBool(ctx, `window.__webchatClient.IsConnectedSucc()`), float64(1))
-}
-
-// 走和用户启动步骤一样的 `npm run build`: prebuild 钩子先把 hgmRoomNotifyBrowserTs 复制进 web/src,
-// 再 esbuild 打包 React 前端到 web/dist/app.js, 读出来返回. node_modules 不在时先 npm install.
-func buildWebChatJs(t *testing.T) string {
-	webDir := hgmFpGowork.MustPathInGoWork("hgmRoomNotify/example/WebChat/web")
-	if _, err := os.Stat(filepath.Join(webDir, "node_modules")); err != nil {
-		runNpm(t, webDir, "install", "--no-audit", "--no-fund")
-	}
-	runNpm(t, webDir, "run", "build")
-	js, err := os.ReadFile(filepath.Join(webDir, "dist", "app.js"))
-	if err != nil {
-		t.Fatalf("读取打包产物 dist/app.js 失败: %v", err)
-	}
-	if len(js) == 0 {
-		t.Fatal("打包产物为空")
-	}
-	return string(js)
-}
-
-func runNpm(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("npm", args...)
-	cmd.Dir = dir
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("npm %v 失败: %v\n%s", args, err, stderr.String())
-	}
 }
 
 func newChromeCtx() *hgmChromeDp.ChromeDpCtx {

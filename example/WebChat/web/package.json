@@ -2,7 +2,7 @@
   "name": "webchat-example",
   "version": "0.0.0",
   "private": true,
-  "description": "hgmRoomNotify WebChat 例子的 React 前端. hgmRoomNotify 浏览器客户端由相对路径 import, 不复制源码.",
+  "description": "hgmRoomNotify WebChat 例子的 React 前端. 浏览器客户端 TS 在编译前由 prebuild 钩子复制进 src(已 gitignore), 仓库不留第二份.",
   "scripts": {
     "copy-client": "node scripts/copy-client.mjs",
     "prebuild": "npm run copy-client",

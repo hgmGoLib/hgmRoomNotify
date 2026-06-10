@@ -4,7 +4,7 @@
 // LiveData 当快路径(省一个 RTT); 客户端 LiveData 缺失/跳号就 ajax 拉 lastIndex 之后的全部补齐.
 //
 // 这个文件是例子里的"数据库": 纯内存, 协程安全, 独立于 ws 层.
-package main
+package webchat
 
 import "sync"
 
@@ -17,13 +17,13 @@ type ChatMsg_t struct {
 }
 
 // 聊天消息存储(例子里的内存数据库). 协程安全. 独立于 ws 层, ws 重启不影响它.
-type chatStore_t struct {
+type ChatStore_t struct {
 	lock  sync.Mutex
 	rooms map[string][]ChatMsg_t // roomId -> 有序消息历史, 下标 i 对应 MsgIndex i+1.
 }
 
 // 追加一条消息, 分配 MsgIndex(= 当前条数+1), 返回写入后的完整消息.
-func (s *chatStore_t) Post(roomId string, sender string, text string) ChatMsg_t {
+func (s *ChatStore_t) Post(roomId string, sender string, text string) ChatMsg_t {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	if s.rooms == nil {
@@ -41,7 +41,7 @@ func (s *chatStore_t) Post(roomId string, sender string, text string) ChatMsg_t 
 }
 
 // 返回 MsgIndex > afterIndex 的所有消息(即客户端 lastIndex 之后还没拿到的部分). 这是 ajax 拉取的后端.
-func (s *chatStore_t) After(roomId string, afterIndex uint64) []ChatMsg_t {
+func (s *ChatStore_t) After(roomId string, afterIndex uint64) []ChatMsg_t {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	list := s.rooms[roomId]
