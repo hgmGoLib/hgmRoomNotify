@@ -241,6 +241,9 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
   断线重连期间的所有中间变更都会丢失, 客户端只看到重连后的最新版本。客户端处理太慢, 中间变更也可能会丢失。
 - `LiveData` 不保证送达。服务端写缓冲满时丢弃, 断线时丢失, 超过上限时丢弃。
   `LiveData` 是尽力而为的附加数据, 不是可靠传输。
+  注意: "不可靠"不等于"无用/该删"——它是可选的延迟优化(命中省一个 RTT + 避免 ajax 惊群),
+  不传时本库就是纯变化触发器, 不付任何代价。把它误当"可靠增量重放流"才是错的, 详见
+  [`doc/liveDataNotReplayStream.md`](doc/liveDataNotReplayStream.md)。
 
 不实现:
 
@@ -301,6 +304,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 | --- | --- |
 | [`doc/config.md`](doc/config.md) | 全部可配置参数(`ServerManager` / `Client` / `TimeoutCfg_t`)的默认值、上限与效果。 |
 | [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md) | 为什么用"ws 戳一下 + DB 拉取"而非"ws 直推内容当可靠", 以及与 Kafka 等方案的对比。 |
+| [`doc/liveDataNotReplayStream.md`](doc/liveDataNotReplayStream.md) | 回应"`LiveData` 不可靠(合并 + 无历史)、做增量徒劳、该删掉"的误区: 它是机会主义快路径 + ajax 兜底, 不是可靠重放流。 |
 | [`doc/hotRoomFanout.md`](doc/hotRoomFanout.md) | 热房间扇出成本与合并缓冲分析(当前有意不实现合并缓冲的原因)。 |
 | [`doc/multiNodeDistribute.md`](doc/multiNodeDistribute.md) | 多节点分布式通知的理论分析(**仅理论, 未实践**)。 |
 
