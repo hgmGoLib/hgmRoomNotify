@@ -1,7 +1,16 @@
 # hgmRoomNotify
 
-基于 WebSocket 的房间状态变更通知框架。服务端维护若干"房间", 数据变更时通知所有订阅了该房间的客户端;
-客户端收到通知后自行通过 ajax 拉取最新数据。框架只负责"戳一下", 不负责传输完整业务数据。
+基于 WebSocket 的房间状态变更通知框架。服务端维护若干"房间", 数据变更时通知所有订阅了该房间的客户端。
+
+核心是低延迟的"变更通知 + ajax 拉取": ws 戳一下告诉客户端某个房间变了, 真实数据和可靠性由业务自己的数据库 + ajax 兜底。
+在此之上, 通知里可以**顺带捎上**两个加速字段, 命中就省一次 ajax 往返(RTT):
+
+- `CVersionId`(≤100 字节, 服务端存当前值): 直接装得下的**短状态量**——如"是否在线"、typing、未读数、数据版本号——
+  客户端 `onChange` 读到就能直接更新, 进房/重连还会自动下发当前值, **常常完全不必再 ajax**。
+- `LiveData`(默认 ≤1024 字节, 仅实时传一次): 一条**一次性增量**——如新聊天消息、streaming 文本片段——命中就直接用, 省掉拉取。
+
+两者都是**尽力而为的加速缓存**, 不是可靠传输: 没命中(没带/超限/缓冲满/重连/重启)时退回 ajax 拉全量即可。
+所以框架既不是"只能戳一下", 也不是"可靠推内容"——它是"戳一下 + 顺带捎点数据省 RTT, 拉取兜底"。
 
 ## 功能概览
 
@@ -10,7 +19,9 @@
 3. 服务端调用 `FireChange(roomId)` 时, 所有订阅了该房间的客户端会收到变更通知。
 4. 变更通知携带以下信息:
    - `GProcessId`+`ChangeSeq`: 框架自动维护。`GProcessId` 是服务端进程 id, `ChangeSeq` 每次 `FireChange` 递增, 客户端用来判断是否有新变化和检测服务器重启。
-   - `CVersionId`: 调用者自定义的版本 id, 最大 100 字节。服务端内存存储, 可选, 服务器重启会丢失。
+   - `CVersionId`: 调用者自定义的版本 id, 最大 100 字节。服务端内存**单值**存储(只存最新一个), 可选。
+     和 `LiveData` 一样**不保证总是有**: 没带的 `FireChange` 会把它清空、服务器重启会丢失、进未变更过的房间为空。
+     只能当"省一次拉取"的机会主义提示, 不能当跳过全量的唯一判据, 详见 [`doc/accelFieldsNotReliable.md`](doc/accelFieldsNotReliable.md)。
    - `LiveData`: 本次变更的附加数据, 默认最大 1024 字节(可调)。服务端不存储, 仅实时传递, 可选; 网络断线重连或服务器重启会丢失。
    - 两者如何选: **当前状态量**("是什么", 如在线/typing、未读数、数据版本号)用 `CVersionId`(存当前值, 进房/重连自动下发, 丢一次会自动收敛, 必要时 ajax 保底);
      **一次性增量**("发生了什么", 如新消息、streaming 片段)用 `LiveData`(尽力而为, 丢了走 ajax 补)。详见下文[工作模式](#工作模式-通知--拉取)。
@@ -164,8 +175,12 @@
 
 | | 服务端存储 | 进房/重连 | 适合什么 |
 | --- | --- | --- | --- |
-| `CVersionId`(≤100 字节) | 存内存当前值 | 进房/重连自动下发当前值 | **当前状态量**("是什么"): 在线/typing、未读数、数据版本号 |
+| `CVersionId`(≤100 字节) | 存内存当前值(只存最新一个) | 进房/重连自动下发当前值 | **当前状态量**("是什么"): 在线/typing、未读数、数据版本号 |
 | `LiveData`(默认 ≤1024 字节) | 不存, 仅实时传一次 | 重连/缓冲满/超限就没了 | **一次性增量**("发生了什么"): 新消息、streaming 文本片段 |
+
+> ⚠ `CVersionId` 和 `LiveData` 一样**不保证总是有**(没带的 `FireChange` 会清空它、服务器重启会丢、进未变更过的房间为空, 且内容框架不解释、不保证单调可比)。
+> 它是"省一次拉取"的机会主义提示, 不是可靠单调版本通道 —— 跳过全量的判据必须是"非空 + 可比 + 同 `RoomEpoch` + `<= 本地`", 其余一律回源拉全量。
+> 把"`CVersionId <= 本地` 就直接跳过、连请求都不发"当唯一闸门会漏掉真实更新, 详见 [`doc/accelFieldsNotReliable.md`](doc/accelFieldsNotReliable.md)。
 
 - **状态量用 `CVersionId`**。它是"当前完整状态", 丢一次通知没关系——下一次通知或进房/重连会带上最新值, **自动收敛到正确状态**。
   例如 typing / 在线状态: `FireChange(RoomId, CVersionId="在线状态编码")`, 客户端 `onChange` 直接读 `ev.CVersionId` 更新 UI, **不需要 ajax**;
@@ -243,7 +258,11 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
   `LiveData` 是尽力而为的附加数据, 不是可靠传输。
   注意: "不可靠"不等于"无用/该删"——它是可选的延迟优化(命中省一个 RTT + 避免 ajax 惊群),
   不传时本库就是纯变化触发器, 不付任何代价。把它误当"可靠增量重放流"才是错的, 详见
-  [`doc/liveDataNotReplayStream.md`](doc/liveDataNotReplayStream.md)。
+  [`doc/accelFieldsNotReliable.md`](doc/accelFieldsNotReliable.md)。
+- `CVersionId` 不保证总是有, 也不保证单调可比。没带 `CVersionId` 的 `FireChange` 会把它清空,
+  服务器重启会丢失, 进未变更过的房间下发为空; 框架不解释其内容、不保证它是数字或递增。
+  它是和 `LiveData` 同级的尽力而为提示, 只能当"省一次拉取"的机会主义优化,
+  不能当跳过全量的唯一判据(否则会漏掉真实更新)。详见 [`doc/accelFieldsNotReliable.md`](doc/accelFieldsNotReliable.md)。
 
 不实现:
 
@@ -294,6 +313,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 | --- | --- | --- |
 | [`SimpleDemo/`](example/SimpleDemo/) | 最小闭环: 同进程起服务端 + Go 客户端, `FireChange` 通知。 | `go run ./SimpleDemo` / `go test ./SimpleDemo` |
 | [`ReliableChat/`](example/ReliableChat/) | ws 戳一下 + ajax 兜底实现可靠聊天: 可靠送达 / 离线消息 / 历史回放 / 断线补发(纯 Go)。 | `go run ./ReliableChat` / `go test ./ReliableChat` |
+| [`SoftwareUpdate/`](example/SoftwareUpdate/) | 软件自动更新对接: 启动先 check api(可靠数据源), 已最新再用 ws + `CVersionId`(加速字段)实时下发新版本。演示 `CVersionId` 正确用法(纯 Go)。 | `go run ./SoftwareUpdate` / `go test ./SoftwareUpdate` |
 | [`WebChat/`](example/WebChat/) | 浏览器 **React** 前端 + Go 后端(内存库)的可靠聊天室, 复用 ReliableChat 的可靠模式; 浏览器客户端编译前复制进前端(gitignore, 仓库不留第二份)。含真 Chrome 真机自动测试。 | `go run ./WebChat/WebChatRun`(一条命令自动编译前端+起后端) / `go test ./WebChat` |
 
 ## 设计文档
@@ -304,7 +324,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 | --- | --- |
 | [`doc/config.md`](doc/config.md) | 全部可配置参数(`ServerManager` / `Client` / `TimeoutCfg_t`)的默认值、上限与效果。 |
 | [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md) | 为什么用"ws 戳一下 + DB 拉取"而非"ws 直推内容当可靠", 以及与 Kafka 等方案的对比。 |
-| [`doc/liveDataNotReplayStream.md`](doc/liveDataNotReplayStream.md) | 回应"`LiveData` 不可靠(合并 + 无历史)、做增量徒劳、该删掉"的误区: 它是机会主义快路径 + ajax 兜底, 不是可靠重放流。 |
+| [`doc/accelFieldsNotReliable.md`](doc/accelFieldsNotReliable.md) | `LiveData` 与 `CVersionId` 是同一类**加速字段**(命中省一次回源, 没命中就回源), 不是可靠字段。回应两个对称误区: "`LiveData` 不可靠、该删" 与 "`CVersionId` 是可靠单调版本号、`<= 本地` 就能跳过全量"。 |
 | [`doc/hotRoomFanout.md`](doc/hotRoomFanout.md) | 热房间扇出成本与合并缓冲分析(当前有意不实现合并缓冲的原因)。 |
 | [`doc/multiNodeDistribute.md`](doc/multiNodeDistribute.md) | 多节点分布式通知的理论分析(**仅理论, 未实践**)。 |
 
