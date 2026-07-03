@@ -18,7 +18,7 @@
 2. 客户端通过 WebSocket 连接后, 可以加入/离开房间。
 3. 服务端调用 `FireChange(roomId)` 时, 所有订阅了该房间的客户端会收到变更通知。
 4. 变更通知携带以下信息:
-   - `GProcessId`+`ChangeSeq`: 框架自动维护。`GProcessId` 是服务端进程 id, `ChangeSeq` 每次 `FireChange` 递增, 客户端用来判断是否有新变化和检测服务器重启。
+   - `RoomEpoch`+`ChangeSeq`: 框架自动维护。`RoomEpoch` 是房间纪元 id(房间创建时生成, 房间被重建或服务器重启都会变化), `ChangeSeq` 在同一 `RoomEpoch` 下每次 `FireChange` 递增; 客户端用 `(RoomEpoch, ChangeSeq)` 判断是否有新变化并检测房间重建/服务器重启。
    - `CVersionId`: 调用者自定义的版本 id, 最大 100 字节。服务端内存**单值**存储(只存最新一个), 可选。
      和 `LiveData` 一样**不保证总是有**: 没带的 `FireChange` 会把它清空、服务器重启会丢失、进未变更过的房间为空。
      只能当"省一次拉取"的机会主义提示, 不能当跳过全量的唯一判据, 详见 [`doc/accelFieldsNotReliable.md`](doc/accelFieldsNotReliable.md)。
@@ -86,7 +86,7 @@
    ```ts
    const leaveFn = client.roomEnter("order:12345", (ev) => {
        // ev.RoomId      房间 id
-       // ev.GProcessId  服务端进程 id(用于检测服务器重启, 通常不需要关心)
+       // ev.RoomEpoch   房间纪元 id(房间重建/服务器重启会变化, 通常不需要关心)
        // ev.ChangeSeq   变化序号(用于去重, 通常不需要关心)
        // ev.CVersionId  自定义版本号
        // ev.LiveData    Uint8Array|null, 附加数据
@@ -114,7 +114,7 @@
 
    ```go
    leaveFn := client.RoomEnter("order:12345", func(ev *hgmRoomNotify.RoomOnChange_t) {
-       // ev.RoomId, ev.GProcessId, ev.ChangeSeq, ev.CVersionId, ev.LiveData
+       // ev.RoomId, ev.RoomEpoch, ev.ChangeSeq, ev.CVersionId, ev.LiveData
    })
    ```
 
@@ -246,7 +246,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 
 保证:
 
-- 在网络正常时, 客户端最终一定能感知到房间"是否发生了变化"(通过 `GProcessId`+`ChangeSeq` 去重)。
+- 在网络正常时, 客户端最终一定能感知到房间"是否发生了变化"(通过 `RoomEpoch`+`ChangeSeq` 去重)。
   即: 如果服务端 `FireChange` 了, 客户端一定会收到一次 onChange 回调(去重后);
   如果服务端没有 `FireChange`, 客户端不会收到虚假的 onChange 回调。
 - 断线重连后, 客户端重新加入房间会收到当前版本号, 如果和断线前不同则触发 onChange。
