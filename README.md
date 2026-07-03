@@ -242,6 +242,8 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 
 ## 语义保证
 
+本框架的保障是一条**活性**命题: **只要客户端与服务端最终都在线、且网络最终双向通畅并保持一段足够完成一次收敛的时间(此前允许任意长时间的断开、丢包、换网、服务器重启), 客户端最终一定收敛到房间的最新状态**(中间变更次数会丢失 / 塌缩)。这依赖两件**各自独立、缺一不可**的事——每次(重)连接做一次全量重新对齐, 以及独立主动探活(不能假设"TCP 没报错就等于连接正常", 中间盒丢包 / 客户端换 IP 都会造成无报错的"静默死链")。**自己实现 ws / SSE / pg `NOTIFY` 刷状态时同样必须做对这两件事**, 详见 [`doc/deliveryGuarantee.md`](doc/deliveryGuarantee.md)(含检查清单)。
+
 保证:
 
 - 在网络正常时, 客户端最终一定能感知到房间"是否发生了变化"(通过 `GProcessId`+`ChangeSeq` 去重)。
@@ -322,6 +324,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 
 | 文档 | 内容 |
 | --- | --- |
+| [`doc/deliveryGuarantee.md`](doc/deliveryGuarantee.md) | 最终收敛保障的精确目标, 以及任何同类系统(含 pg `NOTIFY` / 手写 SSE)都必须做对的两件正交的事: 每次(重)连接全量重新对齐 + 独立主动探活(应对中间盒丢包 / 换 IP 造成的无报错静默死链)。含通知级联时"短板决定整条链、hgmRoomNotify 补不回上游丢的"分析与自查清单。 |
 | [`doc/config.md`](doc/config.md) | 全部可配置参数(`ServerManager` / `Client` / `TimeoutCfg_t`)的默认值、上限与效果。 |
 | [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md) | 为什么用"ws 戳一下 + DB 拉取"而非"ws 直推内容当可靠", 以及与 Kafka 等方案的对比。 |
 | [`doc/accelFieldsNotReliable.md`](doc/accelFieldsNotReliable.md) | `LiveData` 与 `CVersionId` 是同一类**加速字段**(命中省一次回源, 没命中就回源), 不是可靠字段。回应两个对称误区: "`LiveData` 不可靠、该删" 与 "`CVersionId` 是可靠单调版本号、`<= 本地` 就能跳过全量"。 |
