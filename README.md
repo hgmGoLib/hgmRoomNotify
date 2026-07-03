@@ -324,7 +324,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 
 | 文档 | 内容 |
 | --- | --- |
-| [`doc/deliveryGuarantee.md`](doc/deliveryGuarantee.md) | 最终收敛保障的精确目标, 以及任何同类系统(含 pg `NOTIFY` / 手写 SSE)都必须做对的两件正交的事: 每次(重)连接全量重新对齐 + 独立主动探活(应对中间盒丢包 / 换 IP 造成的无报错静默死链)。含自查清单。 |
+| [`doc/deliveryGuarantee.md`](doc/deliveryGuarantee.md) | 最终收敛保障的精确目标, 以及任何同类系统(含 pg `NOTIFY` / 手写 SSE)都必须做对的两件正交的事: 每次(重)连接全量重新对齐 + 独立主动探活(应对中间盒丢包 / 换 IP 造成的无报错静默死链)。含通知级联时"短板决定整条链、hgmRoomNotify 补不回上游丢的"分析与自查清单。 |
 | [`doc/config.md`](doc/config.md) | 全部可配置参数(`ServerManager` / `Client` / `TimeoutCfg_t`)的默认值、上限与效果。 |
 | [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md) | 为什么用"ws 戳一下 + DB 拉取"而非"ws 直推内容当可靠", 以及与 Kafka 等方案的对比。 |
 | [`doc/accelFieldsNotReliable.md`](doc/accelFieldsNotReliable.md) | `LiveData` 与 `CVersionId` 是同一类**加速字段**(命中省一次回源, 没命中就回源), 不是可靠字段。回应两个对称误区: "`LiveData` 不可靠、该删" 与 "`CVersionId` 是可靠单调版本号、`<= 本地` 就能跳过全量"。 |
