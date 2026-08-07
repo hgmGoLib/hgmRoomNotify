@@ -15,6 +15,12 @@ import (
 )
 
 type Client_ctx_t struct {
+	// 发起 websocket 升级请求用的 http.Client. nil 表示用本 package 内置的(按 EnableTlsVerify 选).
+	// 非 nil 时完全以本字段为准, EnableTlsVerify 被忽略.
+	// 本 package 不持有/不关闭它, 生命周期由调用者负责.
+	// 不用担心 HTTP/2: 下面设的 Connection/Upgrade 两个头会让 net/http 的 Request.requiresHTTP1()
+	// 把这条请求锁死在 HTTP/1.1 上(清空 ALPN + 不复用 h2 连接), 所以标准 *http.Transport 随便传.
+	HttpClient      *http.Client
 	EnableTlsVerify bool
 	Url             string
 	ReqHeader       http.Header
@@ -63,7 +69,10 @@ func (ctx *Client_ctx_t) Call() {
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Version", "13")
 	req.Header.Set("Sec-WebSocket-Key", key)
-	httpClient := getHttpClient(ctx.EnableTlsVerify)
+	httpClient := ctx.HttpClient
+	if httpClient == nil {
+		httpClient = getHttpClient(ctx.EnableTlsVerify)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		ctx.ErrMsg = err.Error()

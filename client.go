@@ -49,6 +49,18 @@ type Client struct {
 	// websocket message 最大读取字节数. 0表示使用默认值64KB, 负值 panic(_init 会把默认值写回本字段).
 	// 必须 >= 服务端 WriteBufMaxBytes(单个 websocket message 最大可达该值), 否则会因消息过大断开.
 	ReadMsgMaxBytes int
+	// 发起 websocket 升级请求(含 tls 握手)用的 http.Client. 可选.
+	// nil: 用本库内置的, 按 ClientWsDialReq_t.EnableTlsVerify 决定验不验证 tls 证书.
+	// 非 nil: 完全以本字段为准, ClientWsDialReq_t.EnableTlsVerify 被忽略(tls 由本 http.Client 的
+	//   Transport.TLSClientConfig 决定). 用途: 自定义 tls.Config(公钥锁定/自定义 CA/双向认证)、http 代理、自定义 dialer.
+	// 生命周期完全由调用者负责: 本库只读取和使用它, 不持有语义, 也不关闭它 —— CloseForTest 不会动它,
+	//   用完后的连接清理(CloseIdleConnections)由调用者自己做.
+	// 必须在第一次 RoomEnter 之前设置好, 之后不再修改(无锁保护, 每次(重)连时直接读本字段).
+	// 不用担心 HTTP/2: websocket 升级只能走 HTTP/1.1, 而 Go 的 net/http 已内建处理 —— 带
+	//   "Connection: upgrade"+"Upgrade: websocket" 的请求会被 Request.requiresHTTP1() 标成 onlyH1,
+	//   握手时清空 ALPN 且不复用已缓存的 h2 连接. 所以标准 *http.Transport 随便传(开着
+	//   ForceAttemptHTTP2 也行). 只有塞进只会 h2 的自定义 RoundTripper(如 x/net/http2.Transport)才会废.
+	HttpClient *http.Client
 
 	thisConn atomic.Pointer[client_conn]
 	lastStartConnectTime           time.Time
@@ -221,6 +233,7 @@ func (c *Client) tryConnOnceSync() (isContinue bool){
 	dialReq:=c.WsDialReqFn()
 	ctx3:=zlibWebsocket2.Client_ctx_t{
 		ReqHeader: http.Header{},
+		HttpClient: c.HttpClient,
 		EnableTlsVerify: dialReq.EnableTlsVerify,
 		Url: dialReq.Url,
 		CloseContext: ctx2,

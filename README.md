@@ -127,6 +127,31 @@
 完整可运行的 Go 端 demo(服务端 + 客户端在一个进程里跑起来)见 [`example/SimpleDemo/`](example/SimpleDemo/),
 运行 `cd example && go run ./SimpleDemo`。全部例子见[示例](#示例)。
 
+#### 自定义 tls / 代理: `Client.HttpClient`
+
+`ClientWsDialReq_t.EnableTlsVerify` 只有"完全不验证"和"走系统信任链标准验证"两档。需要别的 tls 行为
+(公钥锁定、自定义 CA、双向认证)或者要走 http 代理 / 自定义 dialer 时, 给 `Client.HttpClient` 挂一个自己的
+`http.Client`:
+
+```go
+var client hgmRoomNotify.Client
+client.HttpClient = &http.Client{
+    Transport: &http.Transport{TLSClientConfig: myTlsConfig},
+}
+client.SetWsDialUrl("wss://example.com/ws")
+```
+
+- 非 `nil` 时**完全以它为准**, `ClientWsDialReq_t.EnableTlsVerify` 被忽略。
+- **生命周期归调用者**: 本库只用它, 不持有也不关闭它(`CloseForTest` 也不动)。建一个复用即可, 要回收时自己
+  `CloseIdleConnections()`。不要在 `WsDialReqFn` 那种每次重连都会跑的地方造新实例, 会泄漏 transport。
+- **不用担心 HTTP/2**: websocket 升级只能走 HTTP/1.1, 但 Go 的 `net/http` 已经内建处理了 —— 带
+  `Connection: upgrade` + `Upgrade: websocket` 的请求会被 `Request.requiresHTTP1()` 标成 onlyH1,
+  握手时清空 ALPN 并且不复用已缓存的 h2 连接。所以标准 `*http.Transport` 随便传(`ForceAttemptHTTP2`
+  开着也没事)。只有塞进只会 h2 的自定义 `RoundTripper`(如 `x/net/http2.Transport`)才会连不上。
+
+内网自研客户端连自研服务端时最实用的用法是**锁定服务端证书公钥**(只认公钥, 不看 CA / 有效期 / 域名),
+完整可运行例子见 [`example/TlsPubKeyPin/`](example/TlsPubKeyPin/)。
+
 ## 工作模式: 通知 + 拉取
 
 本框架的设计意图是作为"变更通知层", 配合 ajax 获取实际数据:
@@ -316,6 +341,7 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 | [`SimpleDemo/`](example/SimpleDemo/) | 最小闭环: 同进程起服务端 + Go 客户端, `FireChange` 通知。 | `go run ./SimpleDemo` / `go test ./SimpleDemo` |
 | [`ReliableChat/`](example/ReliableChat/) | ws 戳一下 + ajax 兜底实现可靠聊天: 可靠送达 / 离线消息 / 历史回放 / 断线补发(纯 Go)。 | `go run ./ReliableChat` / `go test ./ReliableChat` |
 | [`SoftwareUpdate/`](example/SoftwareUpdate/) | 软件自动更新对接: 启动先 check api(可靠数据源), 已最新再用 ws + `CVersionId`(加速字段)实时下发新版本。演示 `CVersionId` 正确用法(纯 Go)。 | `go run ./SoftwareUpdate` / `go test ./SoftwareUpdate` |
+| [`TlsPubKeyPin/`](example/TlsPubKeyPin/) | 用 `Client.HttpClient` 锁定服务端证书的**公钥**(只认公钥, 不看 CA / 有效期 / 域名)。含"标准验证失败 / 锁对公钥连上 / 锁错公钥连不上"三场景对比与真 tls 自动测试。 | `go run ./TlsPubKeyPin` / `go test ./TlsPubKeyPin` |
 | [`WebChat/`](example/WebChat/) | 浏览器 **React** 前端 + Go 后端(内存库)的可靠聊天室, 复用 ReliableChat 的可靠模式; 浏览器客户端编译前复制进前端(gitignore, 仓库不留第二份)。含真 Chrome 真机自动测试。 | `go run ./WebChat/WebChatRun`(一条命令自动编译前端+起后端) / `go test ./WebChat` |
 
 ## 设计文档
