@@ -12,7 +12,7 @@ import (
 )
 
 // 本文件是 webchat_test.go 用到的测试工具的"开源自带简化版":
-// 原本依赖私有 hgmLib(hgmChromeDp/hgmTest/hgmTestTimeout), 开源仓库里不能依赖,
+// 原本依赖作者的私有内部库(无头浏览器封装 / 测试断言 / 测试超时), 开源仓库里不能依赖,
 // 所以把这三样按本测试实际用到的最小功能内联到这里, 只依赖第三方 github.com/chromedp/chromedp.
 
 // 进程内无头浏览器自动化上下文. 封装 chromedp 的 ExecAllocator + Context.

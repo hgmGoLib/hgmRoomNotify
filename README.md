@@ -175,6 +175,9 @@ client.SetWsDialUrl("wss://example.com/ws")
 - 断线重连本身就要 ajax 重新取完整状态, 所以这个降级路径本来就得有。
 - 不要试图通过 ws 推送完整的大块数据(如完整 streaming 内容), 否则会有阻塞/爆内存风险。
   让 ws 只负责通知, 大数据走 ajax, 两条路径各司其职。
+- ⚠ 注意这里推荐的是**用 `LiveData` 装每次的增量文本**, 不是"只戳一下让客户端自己拉全文"。
+  后者每次拉的都是**当前全文**, 累计流量 O(n²), 是吐字场景最容易踩的坑。
+  详见 [`doc/webChatBestPractice.md`](doc/webChatBestPractice.md) 3.8 节。
 
 为什么是"戳一下 + 拉取"而不是"直接用 ws 推内容当可靠", 以及为什么在本库约束下这已是已知最优结构(剩下只能调参数),
 见 [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md)。
@@ -190,7 +193,7 @@ client.SetWsDialUrl("wss://example.com/ws")
 | 客户端收到通知后拉取最新消息列表 | 适合 |
 | 未读数、会话列表刷新通知 | 适合 |
 | typing / 在线状态这类当前状态量 | 适合(用 `CVersionId` 存当前状态, 进房/重连自动下发, 必要时 ajax 保底) |
-| 每条聊天消息可靠送达 | 适合(ws 通知 + ajax 兜底, 见 [`example/ReliableChat/`](example/ReliableChat/); 纯靠 ws `LiveData` 当可靠送达不适合) |
+| 每条聊天消息可靠送达 | 小规模适合(ws 通知 + ajax 兜底, 见 [`example/ReliableChat/`](example/ReliableChat/); 纯靠 ws `LiveData` 当可靠送达不适合)。**但正式做聊天软件的消息正文, 先看 [`doc/webChatBestPractice.md`](doc/webChatBestPractice.md)** —— 只戳不带内容会导致 ajax 泛滥 + 1.5 RTT 才看到消息, 那边给了六条判据和该用的协议 |
 | 离线消息、消息历史、回放、断线补发 | 适合(历史存数据库 + ajax 拉取, ws 只负责戳一下, 见 [`example/ReliableChat/`](example/ReliableChat/)) |
 | 大规模多节点分布式通知 | 需要额外改造(本库是单进程房间表)。看起来有办法解决、且全广播档不用改库, 理论分析见 [`doc/multiNodeDistribute.md`](doc/multiNodeDistribute.md)(**仅理论, 未实践**) |
 
@@ -350,6 +353,10 @@ debugDiv.textContent = `status=${status} lastConfirm=${sinceLast}ms rooms=${clie
 
 | 文档 | 内容 |
 | --- | --- |
+| [`doc/pushCorrectness.md`](doc/pushCorrectness.md) | **判断"我这么做对不对"从这篇开始**: 推送正确性的三条规则(必须有全量对齐这条路 / 必须能触发它 / 通知窗口必须覆盖快照点), 逐环逐流套用的检查方法, 以及十种真实存在的推送形式(手动刷新 / 轮询 / 长轮询 / 纯戳 / 戳+版本号 / 推全量 / 推增量+序号 / CRDT / 日志跟随 / APNs 唤醒)在 **正确性 / 实时性 / 性能** 三个指标上的分类分析。含终极断言与故障注入清单。 |
+| [`doc/webChatBestPractice.md`](doc/webChatBestPractice.md) | **什么时候不该用本库**: "戳一下 + 拉取" 与 "推内容 + 序号" 的六条选择判据(塌缩率 / 变更描述与内容之比 / 延迟 / 扇出同步尖峰 / 移动耗电 / UI 即时性), 以及聊天正文该用的完整 ws 协议设计。含纯戳的正面案例(Figma LiveGraph / IMAP IDLE)与它成立的前提条件。 |
+| [`doc/pushDesignAndReview.md`](doc/pushDesignAndReview.md) | **执行手册: 按 正确性 > 延时 > 并发 > 带宽 > 简单性 做一套 ws/tcp 推送, 具体怎么执行、做完怎么检查。** 七步走(写可证伪的目标 → 把数据切成桶逐桶选方案 → 写协议帧 → 写服务端 → 写客户端 → 参数表与三条不变式 → 搭测试过 22 条验收清单), 每条规则带一行"违反后果"。**单独看这一篇就能执行完整套**, 不需要先读别的文档。 |
+| [`doc/pushDesignRationale.md`](doc/pushDesignRationale.md) | 上一篇的**由来**: 每条规则为什么是那样。核心是"**并发目标决定了版本号必须内生于数据**"(锁不是为了保护数据, 是为了给外生号赋予意义), 以及由此穷举出的三种 id 数据结构、seqlock 不变式推导、"订阅先于快照 + 缓冲重放"等价于锁内原子的证明、帧信封与压缩的实测账、以及踩过的坑。**想删掉/放宽执行手册里某条规则时才需要读。** |
 | [`doc/deliveryGuarantee.md`](doc/deliveryGuarantee.md) | 最终收敛保障的精确目标, 以及任何同类系统(含 pg `NOTIFY` / 手写 SSE)都必须做对的两件正交的事: 每次(重)连接全量重新对齐 + 独立主动探活(应对中间盒丢包 / 换 IP 造成的无报错静默死链)。含通知级联时"短板决定整条链、hgmRoomNotify 补不回上游丢的"分析与自查清单。 |
 | [`doc/config.md`](doc/config.md) | 全部可配置参数(`ServerManager` / `Client` / `TimeoutCfg_t`)的默认值、上限与效果。 |
 | [`doc/whyNotifyNotPush.md`](doc/whyNotifyNotPush.md) | 为什么用"ws 戳一下 + DB 拉取"而非"ws 直推内容当可靠", 以及与 Kafka 等方案的对比。 |

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// 真机自动测试(正常路径): 沿用 hgmRoomNotifyTest/hgmRoomNotifyBrowserTest 的模式 ——
+// 真机自动测试(正常路径):
 // 用 esbuild 把 React 前端(含 hgmRoomNotify 浏览器客户端)打包成单文件 JS, 起真后端(真 http+ws+ajax),
 // 用真 Chrome(zlib_test.go 里的简化 chromedp 封装)加载页面, 验证浏览器<->golang 的可靠聊天闭环走通:
 //  1. 浏览器加载页面 -> ws 连接成功并进房间.

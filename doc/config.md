@@ -25,7 +25,7 @@
 
 **不用担心 HTTP/2。** websocket 升级只能走 HTTP/1.1(依赖 101 Switching Protocols), 但 Go 的 `net/http` 已经内建处理: 带 `Connection: upgrade` + `Upgrade: websocket` 的请求被 `Request.requiresHTTP1()` 标成 onlyH1, `persistConn.addTLS` 握手前清空 `NextProtos`(不发 ALPN 扩展), `useRegisteredProtocol` 也不让它复用已缓存的 h2 连接。所以标准 `*http.Transport` 随便传, `ForceAttemptHTTP2` 开着(`http.DefaultTransport` 就是)也照样连得上。只有塞进一个只会 h2 的自定义 `RoundTripper`(如直接用 `golang.org/x/net/http2.Transport`)才会连不上。
 
-这条行为有自动测试兜底: `hgmRoomNotifyTest/TestClientHttpClientHttp2_test.go` 用一台 ALPN 广播 `["h2","http/1.1"]` 的标准 tls 服务端, 同一个 `ForceAttemptHTTP2=true` 的 transport 发普通请求走 HTTP/2、连 websocket 走 HTTP/1.1 且正常收发。
+这条行为有自动测试兜底(测试在作者的私有集成测试工程里, 未随本开源仓库发布): 用一台 ALPN 广播 `["h2","http/1.1"]` 的标准 tls 服务端, 同一个 `ForceAttemptHTTP2=true` 的 transport 发普通请求走 HTTP/2、连 websocket 走 HTTP/1.1 且正常收发。
 
 本字段必须在第一次 `RoomEnter` 之前设置好, 之后不再修改(无锁保护, 每次(重)连时直接读本字段)。
 

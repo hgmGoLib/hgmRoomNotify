@@ -12,7 +12,7 @@ type RoomOnChange_t struct {
 	RoomEpoch    string // 房间纪元id. 每次房间被创建时生成. 不同的 RoomEpoch 表示房间被重建过(包括服务器重启).
 	ChangeSeq    uint64 // 变化序号. 同一个 RoomEpoch 下递增表示有新变化.
 	CVersionId   string // 自定义版本id. 服务器内存存储该数据. 调用者用于追踪实际数据变化. 最大100字节.
-	LiveData     []byte // hgmBjson编码的实时数据. 长度为0表示本次没有传输. 只读,多个listener共享同一底层数组.
+	LiveData     []byte // 实时数据,调用者负责序列化. 长度为0表示本次没有传输. 只读,多个listener共享同一底层数组.
 	ErrMsg       string // 回调中设置此字段表示报错. 非空时客户端进入 needManual 状态.
 }
 

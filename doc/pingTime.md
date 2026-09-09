@@ -65,7 +65,7 @@ C. 服务端对偶
 * ClientIdleToSendKeepAliveDur (= 上面的 dur, 默认 4.5s, 最小 100ms)
 * ClientLastReadToReconnectDur (= 上面的 readTimeout, 默认 10s, 最小 100ms)
 * ServerLastReadToCloseDur     (= 服务端的 readTimeout, 默认 120s, 仅服务端使用, 不参与协议序列化)
-默认值的最小钳制由 03libProtocol.go func InitWithDefault 用 hgmMath.InitDefaultMin 完成.
+默认值的最小钳制由 03libProtocol.go func InitWithDefault 用 zlibMath.InitDefaultMin 完成.
 
 
 具体如何实现
@@ -129,9 +129,10 @@ C 的实现 (服务端):
 正反向场景与测试
 =================
 
-下面列出的所有测试都在 hgmRoomNotify 包内. 没有特别说明的都不需要 IS_RUN_SLOW.
+下面列出的测试跑在作者的私有集成测试工程里(依赖内部测试工具, 未随本开源仓库发布),
+这里只记录场景与验证点, 便于自己复现同样的用例. 没有特别说明的都不需要 IS_RUN_SLOW.
 
-* 场景1: 中间转发路由器忽然双向 block 长时间, 然后会断开. (用 hgmTcpMockProxy.SetBlock 模拟)
+* 场景1: 中间转发路由器忽然双向 block 长时间, 然后会断开. (用可控的 tcp mock 代理阻断双向流量来模拟)
     测试: TestPingTime_blockDisconnect       (快速测试, 默认运行)
     测试: TestPingFail_serverBlock            (慢速测试, 需 IS_RUN_SLOW=1, 见 TestPingFail_serverBlock_test.go)
     测试: TestPingFail_serverBlock2           (慢速测试, 需 IS_RUN_SLOW=1, 重复跑3遍稳定性验证)
